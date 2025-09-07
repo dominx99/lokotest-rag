@@ -11,6 +11,8 @@ from typing import List, Dict, Any, Tuple, Set, Optional
 from dataclasses import dataclass
 from enum import Enum
 import json
+import hashlib
+import time
 
 import httpx
 import regex as re_regex
@@ -47,29 +49,64 @@ class RAGConfig:
     openai_api_key: str = os.environ.get("OPENAI_API_KEY", "")
 
     # Search parameters
-    top_k: int = int(os.environ.get("RAG_TOPK", "5"))
-    chars_per_hit: int = int(os.environ.get("RAG_CHARS_PER_HIT", "500"))
+    top_k: int = int(os.environ.get("RAG_TOPK", "4"))  # Reduced from 5
+    chars_per_hit: int = int(os.environ.get("RAG_CHARS_PER_HIT", "400"))  # Reduced from 500
 
     # Response limits
-    max_completion_tokens: int = 2000
+    max_completion_tokens: int = 4000
+    
+    # Cache settings
+    cache_ttl: int = int(os.environ.get("CACHE_TTL", "3600"))  # 1 hour
+
+
+class ResponseCache:
+    """Simple in-memory response cache."""
+    
+    def __init__(self, ttl: int = 3600):
+        self.ttl = ttl
+        self.cache = {}
+    
+    def _get_key(self, question: str) -> str:
+        """Generate cache key from question."""
+        return hashlib.md5(question.lower().strip().encode()).hexdigest()
+    
+    def get(self, question: str) -> Optional[Dict[str, Any]]:
+        """Get cached response if exists and not expired."""
+        key = self._get_key(question)
+        if key in self.cache:
+            cached_time, response = self.cache[key]
+            if time.time() - cached_time < self.ttl:
+                return response
+            else:
+                # Remove expired entry
+                del self.cache[key]
+        return None
+    
+    def set(self, question: str, response: Dict[str, Any]) -> None:
+        """Cache response."""
+        key = self._get_key(question)
+        self.cache[key] = (time.time(), response)
+    
+    def clear(self) -> None:
+        """Clear all cached responses."""
+        self.cache.clear()
+    
+    def size(self) -> int:
+        """Get number of cached items."""
+        return len(self.cache)
 
 
 class PromptTemplates:
     """Improved prompt templates for better responses."""
 
-    SYSTEM_PROMPT = """Odpowiadaj na pytania dotyczące polskich przepisów kolejowych wyłącznie na podstawie dostarczonych źródeł. Odpowiadaj po polsku, używając tylko informacji zawartych w źródłach. Bądź precyzyjny i konkretny."""
+    SYSTEM_PROMPT = """Odpowiadaj zwięźle na pytania o przepisy kolejowe używając TYLKO informacji ze źródeł. Odpowiadaj po polsku."""
 
     USER_TEMPLATE = """PYTANIE: {question}
 
-DOSTĘPNE ŹRÓDŁA:
+ŹRÓDŁA:
 {context}
 
-INSTRUKCJA:
-Odpowiedz precyzyjnie na pytanie używając TYLKO informacji z powyższych źródeł. 
-Jeśli pytanie dotyczy prędkości, podaj konkretne wartości z przepisów.
-Jeśli pytanie dotyczy procedur, opisz kolejne kroki.
-Jeśli informacja nie znajduje się w źródłach, powiedz o tym wprost.
-Zakończ sekcją "Źródła:" z listą cytowanych dokumentów."""
+Odpowiedz zwięźle używając informacji ze źródeł. Jeśli nie ma odpowiedzi w źródłach, napisz to wprost."""
 
 
 class TextProcessor:
@@ -179,7 +216,8 @@ class DocumentRetriever:
     def retrieve_documents(self, question: str) -> List[Dict[str, Any]]:
         """Retrieve relevant documents for the question."""
         try:
-            with httpx.Client(timeout=120) as client:
+            # Reduced timeout for faster failure detection
+            with httpx.Client(timeout=30) as client:
                 response = client.get(
                     self.config.retriever_url,
                     params={"q": question}
@@ -188,9 +226,6 @@ class DocumentRetriever:
                 data = response.json()
                 hits = data.get("hits", [])[:self.config.top_k]
                 logger.info(f"Retriever returned {len(hits)} hits")
-                for i, hit in enumerate(hits):
-                    logger.info(
-                        f"Hit {i+1}: {hit.get('title', 'No title')} - {hit.get('text', '')[:100]}...")
                 return hits
 
         except httpx.RequestError as e:
@@ -212,7 +247,10 @@ class AnswerGenerator:
 
     def __init__(self, config: RAGConfig):
         self.config = config
-        self.client = OpenAI(api_key=config.openai_api_key)
+        self.client = OpenAI(
+            api_key=config.openai_api_key,
+            timeout=30.0  # 30 second timeout
+        )
 
     def format_citation(self, hit: Dict[str, Any]) -> str:
         """Format citation for a document hit."""
@@ -318,6 +356,9 @@ class AnswerGenerator:
                 else:
                     logger.warning(f"OpenAI response content is empty. Finish reason: {
                                    finish_reason}")
+                    if finish_reason == "length":
+                        # Return partial response for length limits
+                        return "Odpowiedź została skrócona ze względu na limit długości. Proszę sprecyzować pytanie."
             else:
                 logger.warning("No choices in OpenAI response")
 
@@ -341,6 +382,7 @@ class RAGAnswerer:
         self.config = config or RAGConfig()
         self.retriever = DocumentRetriever(self.config)
         self.generator = AnswerGenerator(self.config)
+        self.cache = ResponseCache(ttl=self.config.cache_ttl)
 
         # Validate configuration
         if not self.config.openai_api_key:
@@ -348,8 +390,14 @@ class RAGAnswerer:
                 "OpenAI API key not set - LLM generation will be disabled")
 
     def ask(self, question: str) -> Dict[str, Any]:
-        """Answer a question using RAG."""
+        """Answer a question using RAG with caching."""
         logger.info(f"Processing question: {question[:100]}...")
+
+        # Check cache first
+        cached_response = self.cache.get(question)
+        if cached_response:
+            logger.info("Returning cached response")
+            return cached_response
 
         try:
             # 1. Retrieve relevant documents
@@ -400,12 +448,18 @@ class RAGAnswerer:
 
             logger.info(f"Generated answer using {method} method")
 
-            return {
+            result = {
                 "answer": final_answer,
                 "hits": hits,
                 "method": method,
                 "question_type": question_type.value
             }
+            
+            # Cache successful responses
+            if method != "error":
+                self.cache.set(question, result)
+            
+            return result
 
         except Exception as e:
             logger.error(f"Error processing question: {e}")
