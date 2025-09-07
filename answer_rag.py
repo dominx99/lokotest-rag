@@ -13,8 +13,10 @@ from enum import Enum
 import json
 
 import httpx
-import regex as re
-from fastapi import FastAPI, Query, HTTPException
+import regex as re_regex
+from fastapi import FastAPI, Query, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
+import re
 from pydantic import BaseModel, Field
 from openai import OpenAI, BadRequestError, NotFoundError
 
@@ -55,7 +57,7 @@ class RAGConfig:
 class PromptTemplates:
     """Improved prompt templates for better responses."""
 
-    SYSTEM_PROMPT = """Jesteś ekspertem od polskich przepisów kolejowych. Odpowiadaj po polsku na podstawie dostarczonych źródeł. Używaj wyłącznie informacji ze źródeł. Bądź precyzyjny i konkretny."""
+    SYSTEM_PROMPT = """Odpowiadaj na pytania dotyczące polskich przepisów kolejowych wyłącznie na podstawie dostarczonych źródeł. Odpowiadaj po polsku, używając tylko informacji zawartych w źródłach. Bądź precyzyjny i konkretny."""
 
     USER_TEMPLATE = """PYTANIE: {question}
 
@@ -74,10 +76,10 @@ class TextProcessor:
     """Enhanced text processing utilities."""
 
     # Improved regex patterns
-    WORD_PATTERN = re.compile(r"\p{L}+", re.UNICODE)
-    SENTENCE_PATTERN = re.compile(
+    WORD_PATTERN = re_regex.compile(r"\p{L}+", re_regex.UNICODE)
+    SENTENCE_PATTERN = re_regex.compile(
         r"(?<=[\.\?!…])\s+(?=[\p{Lu}ĄĆĘŁŃÓŚŹŻ])",
-        re.UNICODE
+        re_regex.UNICODE
     )
 
     # Question type detection patterns
@@ -421,6 +423,91 @@ app = FastAPI(
     version="2.0"
 )
 
+# Custom CORS middleware with regex support
+
+
+class RegexCORSMiddleware:
+    def __init__(self, app, allow_origin_regex: str = None, **kwargs):
+        self.app = app
+        self.allow_origin_regex = allow_origin_regex
+        self.allow_credentials = kwargs.get("allow_credentials", True)
+        self.allow_methods = kwargs.get(
+            "allow_methods", ["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+        self.allow_headers = kwargs.get("allow_headers", ["*"])
+        self.expose_headers = kwargs.get("expose_headers", ["*"])
+
+        if allow_origin_regex:
+            self.origin_pattern = re.compile(allow_origin_regex)
+        else:
+            self.origin_pattern = None
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        origin = None
+        headers = dict(scope.get("headers", []))
+
+        # Get origin header
+        for name, value in headers.items():
+            if name == b"origin":
+                origin = value.decode("utf-8")
+                break
+
+        # Handle preflight OPTIONS request
+        if scope["method"] == "OPTIONS" and origin:
+            if self.origin_pattern and self.origin_pattern.match(origin):
+                await send({
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [
+                        (b"access-control-allow-origin", origin.encode()),
+                        (b"access-control-allow-credentials", b"true"),
+                        (b"access-control-allow-methods",
+                         b", ".join(self.allow_methods).encode()),
+                        (b"access-control-allow-headers", b"*"),
+                        (b"access-control-max-age", b"600"),
+                        (b"vary", b"Origin"),
+                        (b"content-length", b"2"),
+                        (b"content-type", b"text/plain; charset=utf-8"),
+                    ]
+                })
+                await send({"type": "http.response.body", "body": b"OK"})
+                return
+
+        # Add CORS headers to response
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start" and origin and self.origin_pattern and self.origin_pattern.match(origin):
+                headers = list(message.get("headers", []))
+                headers.extend([
+                    (b"access-control-allow-origin", origin.encode()),
+                    (b"access-control-allow-credentials", b"true"),
+                    (b"access-control-expose-headers", b"*"),
+                    (b"vary", b"Origin"),
+                ])
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+# Configure CORS origin regex
+
+
+def get_cors_origin_regex() -> str:
+    """Get CORS origin regex from environment variable."""
+    cors_origin_regex = os.environ.get("CORS_ORIGIN_REGEX", "")
+    if not cors_origin_regex:
+        raise ValueError("CORS_ORIGIN_REGEX environment variable must be set")
+
+    logger.info(f"CORS origin regex configured: {cors_origin_regex}")
+    return cors_origin_regex
+
+
+# Add custom CORS middleware
+cors_origin_regex = get_cors_origin_regex()
+app.add_middleware(RegexCORSMiddleware, allow_origin_regex=cors_origin_regex)
+
 # Global RAG instance
 rag_answerer = RAGAnswerer()
 
@@ -452,6 +539,19 @@ def ask_post(request: AskRequest):
 def health_check():
     """Health check endpoint."""
     return {"status": "healthy", "version": "2.0"}
+
+
+@app.options("/ask")
+def options_ask():
+    """Handle CORS preflight requests for /ask endpoint."""
+    return {"message": "CORS preflight successful"}
+
+
+@app.get("/test-cors")
+def test_cors(response: Response):
+    """Test endpoint to verify CORS is working."""
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    return {"message": "CORS test", "cors": "should work"}
 
 
 def cli():

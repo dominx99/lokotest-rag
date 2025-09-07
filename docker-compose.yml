@@ -16,6 +16,9 @@ services:
       - MERGE_TOPK=${MERGE_TOPK:-40}
       - FINAL_K=${FINAL_K:-8}
       - RRF_K=${RRF_K:-60}
+    volumes:
+      - .:/app
+      - ./rag_prep:/app/rag_prep
     networks:
       - internal
 
@@ -31,9 +34,11 @@ services:
       - RAG_TOPK=${RAG_TOPK:-5}
       - RAG_CHARS_PER_HIT=${RAG_CHARS_PER_HIT:-500}
       - LOG_LEVEL=${LOG_LEVEL:-WARNING}
+      - CORS_ORIGIN_REGEX=${CORS_ORIGIN_REGEX:-^https?://(.*\.)?docker\.localhost(:[0-9]+)?$}
+    volumes:
+      - .:/app
     depends_on:
-      rag_retriever:
-        condition: service_healthy
+      - rag_retriever
     labels:
       - traefik.enable=true
       - traefik.docker.network=proxy
@@ -43,7 +48,7 @@ services:
     networks:
       internal:
       proxy:
-        ipv4_address: 10.200.5.6
+        ipv4_address: 10.200.23.6
 
 networks:
   internal:
