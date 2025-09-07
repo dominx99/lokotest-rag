@@ -34,12 +34,12 @@ RERANKER  ?= jinaai/jina-reranker-v2-base-multilingual
 # Hybrid search parameters
 VEC_TOPK   ?= 100
 BM25_TOPK  ?= 150
-MERGE_TOPK ?= 40
-FINAL_K    ?= 8
+MERGE_TOPK ?= 50
+FINAL_K    ?= 10
 RRF_K      ?= 60
 
 # Answering LLM
-RAG_CHAT_MODEL ?= gpt-5
+RAG_CHAT_MODEL ?= gpt-4o-mini
 
 # -------- Default target --------
 .PHONY: help

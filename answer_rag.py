@@ -44,35 +44,16 @@ class RAGConfig:
     
     # Search parameters
     top_k: int = int(os.environ.get("RAG_TOPK", "5"))
-    chars_per_hit: int = int(os.environ.get("RAG_CHARS_PER_HIT", "600"))
+    chars_per_hit: int = int(os.environ.get("RAG_CHARS_PER_HIT", "500"))
     
     # Response limits
-    max_completion_tokens: int = 300
-    max_extractive_bullets: int = 8
-    max_sentences_per_hit: int = 2
-    
-    # Context window management
-    context_overlap_threshold: float = 0.15
-    min_answer_length: int = 30
+    max_completion_tokens: int = 2000
 
 
 class PromptTemplates:
     """Improved prompt templates for better responses."""
     
-    SYSTEM_PROMPT = """Jesteś ekspertem RAG odpowiadającym precyzyjnie po polsku na podstawie dostarczonych źródeł.
-
-ZASADY ODPOWIADANIA:
-1. STRUKTURA: Zwięzła odpowiedź (maks. 5 punktów LUB 100-150 słów) + sekcja "Źródła:"
-2. DOKŁADNOŚĆ: Używaj TYLKO informacji z dostarczonych fragmentów
-3. CYTOWANIE: Zawsze podaj konkretne źródła (dokument, strona, ID chunka)
-4. PRZEJRZYSTOŚĆ: Jeśli informacje są niepełne, wskaż czego brakuje
-5. SPECJALIZACJA: 
-   - Procedury → wypunktuj kroki (maks. 7)
-   - Definicje → podaj źródło i kontekst
-   - Prędkości/terminy → cytuj dokładne wartości
-6. JĘZYK: Używaj jasnego, technicznego polskiego
-
-NIGDY nie wymyślaj faktów spoza dostarczonych źródeł."""
+    SYSTEM_PROMPT = """Jesteś ekspertem od polskich przepisów kolejowych. Odpowiadaj po polsku na podstawie dostarczonych źródeł. Używaj wyłącznie informacji ze źródeł. Bądź precyzyjny i konkretny."""
 
     USER_TEMPLATE = """PYTANIE: {question}
 
@@ -80,10 +61,11 @@ DOSTĘPNE ŹRÓDŁA:
 {context}
 
 INSTRUKCJA:
-Odpowiedz zwięźle na pytanie używając TYLKO informacji z powyższych źródeł. 
+Odpowiedz precyzyjnie na pytanie używając TYLKO informacji z powyższych źródeł. 
+Jeśli pytanie dotyczy prędkości, podaj konkretne wartości z przepisów.
+Jeśli pytanie dotyczy procedur, opisz kolejne kroki.
+Jeśli informacja nie znajduje się w źródłach, powiedz o tym wprost.
 Zakończ sekcją "Źródła:" z listą cytowanych dokumentów."""
-
-    EXTRACTIVE_INTRO = "Na podstawie przeszukanych dokumentów:"
 
 
 class TextProcessor:
@@ -146,13 +128,26 @@ class TextProcessor:
             if len(result + sent) <= limit:
                 result += sent + " "
             else:
+                # If adding this sentence would exceed limit, but result is empty,
+                # add at least part of the sentence
+                if not result and len(sent) > 100:
+                    # Add up to limit but try to end at word boundary
+                    cutoff = text[:limit].rfind(' ')
+                    if cutoff > limit * 0.8:  # Only use word boundary if it's not too far back
+                        result = text[:cutoff]
+                    else:
+                        result = text[:limit]
                 break
         
         if result:
             return result.strip()
         
         # Fall back to word boundary
-        return text[:limit].rsplit(" ", 1)[0] if " " in text[:limit] else text[:limit]
+        cutoff = text[:limit].rfind(' ')
+        if cutoff > limit * 0.8:  # Only use word boundary if it's not too far back
+            return text[:cutoff]
+        else:
+            return text[:limit]
     
     @staticmethod
     def detect_question_type(question: str) -> QuestionType:
@@ -171,116 +166,6 @@ class TextProcessor:
             return QuestionType.GENERAL
 
 
-class ExtractiveSearch:
-    """Enhanced extractive search for specialized queries."""
-    
-    def __init__(self, config: RAGConfig):
-        self.config = config
-    
-    def calculate_overlap_score(self, query_tokens: List[str], text_tokens: List[str]) -> float:
-        """Calculate semantic overlap between query and text."""
-        if not query_tokens or not text_tokens:
-            return 0.0
-        
-        query_set = set(query_tokens)
-        intersection = sum(1 for token in text_tokens if token in query_set)
-        
-        # Improved scoring with length normalization
-        base_score = intersection / len(text_tokens)
-        length_bonus = min(1.0, len(text_tokens) / 20)  # Prefer longer sentences
-        
-        return base_score * (1 + length_bonus * 0.2)
-    
-    def extract_best_sentences(
-        self, 
-        question: str, 
-        hits: List[Dict[str, Any]]
-    ) -> List[Tuple[str, Dict[str, Any]]]:
-        """Extract most relevant sentences from hits."""
-        query_tokens = TextProcessor.tokenize(question)
-        candidates = []
-        
-        for hit in hits:
-            text = hit.get("text", "")
-            sentences = TextProcessor.split_sentences(text)
-            
-            for sentence in sentences:
-                if len(sentence) < 20:  # Skip very short sentences
-                    continue
-                
-                sentence_tokens = TextProcessor.tokenize(sentence)
-                score = self.calculate_overlap_score(query_tokens, sentence_tokens)
-                
-                if score > self.config.context_overlap_threshold:
-                    candidates.append((score, sentence.strip(), hit))
-        
-        # Sort by score and deduplicate
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        
-        seen = set()
-        results = []
-        for score, sentence, hit in candidates:
-            # Simple deduplication by first 100 chars
-            key = sentence.lower()[:100]
-            if key not in seen:
-                seen.add(key)
-                results.append((sentence, hit))
-                if len(results) >= self.config.max_extractive_bullets:
-                    break
-        
-        return results
-    
-    def extract_speed_info(self, hits: List[Dict[str, Any]]) -> List[Tuple[str, Dict[str, Any]]]:
-        """Extract speed-related information."""
-        # Enhanced speed pattern with more context
-        speed_pattern = re.compile(
-            r"(prędkość\w*|dozwolon\w*|dopuszczaln\w*|maksymaln\w*|ograniczon\w*|vmax|v\s*=?)"
-            r"[^\.\n]{0,200}?"
-            r"(\d{1,3}(?:[.,]\d{1,2})?(?:\s*[-–]\s*\d{1,3}(?:[.,]\d{1,2})?)?)\s*"
-            r"(?:km\s*/?\s*h|km\s+na\s+g(?:odz)?\.?)",
-            re.IGNORECASE | re.UNICODE
-        )
-        
-        results = []
-        for hit in hits:
-            text = hit.get("text", "").replace("\n", " ")
-            for match in speed_pattern.finditer(text):
-                start = max(0, match.start() - 100)
-                end = min(len(text), match.end() + 100)
-                context = TextProcessor.clean_text(text[start:end])
-                results.append((context, hit))
-                if len(results) >= 6:
-                    break
-            if len(results) >= 6:
-                break
-        
-        return results
-    
-    def extract_deadline_info(self, hits: List[Dict[str, Any]]) -> List[Tuple[str, Dict[str, Any]]]:
-        """Extract deadline-related information."""
-        deadline_pattern = re.compile(
-            r"(termin\w*|najpóźniej|w\s+ciągu|do\s+dnia|nie\s+później\s+niż|w\s+terminie)"
-            r"[^\.\n]{0,200}?"
-            r"(\d{1,2}\.\d{1,2}\.\d{4}|\d+\s*(?:dni|godz(?:in)?|tyg(?:odni)?|mies(?:ięcy)?))",
-            re.IGNORECASE | re.UNICODE
-        )
-        
-        results = []
-        for hit in hits:
-            text = hit.get("text", "").replace("\n", " ")
-            for match in deadline_pattern.finditer(text):
-                start = max(0, match.start() - 100)
-                end = min(len(text), match.end() + 100)
-                context = TextProcessor.clean_text(text[start:end])
-                results.append((context, hit))
-                if len(results) >= 6:
-                    break
-            if len(results) >= 6:
-                break
-        
-        return results
-
-
 class DocumentRetriever:
     """Handle document retrieval from the retriever service."""
     
@@ -297,7 +182,11 @@ class DocumentRetriever:
                 )
                 response.raise_for_status()
                 data = response.json()
-                return data.get("hits", [])[:self.config.top_k]
+                hits = data.get("hits", [])[:self.config.top_k]
+                logger.info(f"Retriever returned {len(hits)} hits")
+                for i, hit in enumerate(hits):
+                    logger.info(f"Hit {i+1}: {hit.get('title', 'No title')} - {hit.get('text', '')[:100]}...")
+                return hits
                 
         except httpx.RequestError as e:
             logger.error(f"Error connecting to retriever service: {e}")
@@ -376,28 +265,62 @@ class AnswerGenerator:
                 )}
             ]
             
+            logger.info(f"Sending prompt with system: {len(PromptTemplates.SYSTEM_PROMPT)} chars, user: {len(messages[1]['content'])} chars")
+            
             # Try with max_completion_tokens first (newer models)
             try:
                 response = self.client.chat.completions.create(
                     model=self.config.openai_model,
                     messages=messages,
                     max_completion_tokens=self.config.max_completion_tokens,
-                    temperature=0.1  # Low temperature for consistency
+                    temperature=0.3
                 )
             except BadRequestError as e:
-                if "max_completion_tokens" in str(e).lower():
+                error_str = str(e).lower()
+                logger.warning(f"BadRequestError with max_completion_tokens: {e}")
+                
+                if "max_completion_tokens" in error_str or "unsupported" in error_str:
                     # Fall back to max_tokens for older models
+                    logger.info("Falling back to max_tokens parameter")
+                    try:
+                        response = self.client.chat.completions.create(
+                            model=self.config.openai_model,
+                            messages=messages,
+                            max_tokens=self.config.max_completion_tokens,
+                            temperature=0.3
+                        )
+                    except BadRequestError as e2:
+                        # Try without temperature
+                        logger.info("Trying without temperature parameter")
+                        response = self.client.chat.completions.create(
+                            model=self.config.openai_model,
+                            messages=messages,
+                            max_tokens=self.config.max_completion_tokens
+                        )
+                elif "model" in error_str and "not found" in error_str:
+                    logger.error(f"Model {self.config.openai_model} not found. Trying gpt-4o-mini as fallback.")
                     response = self.client.chat.completions.create(
-                        model=self.config.openai_model,
+                        model="gpt-4o-mini",
                         messages=messages,
                         max_tokens=self.config.max_completion_tokens,
-                        temperature=0.1
+                        temperature=0.3
                     )
                 else:
                     raise
             
             if response.choices:
-                return response.choices[0].message.content.strip()
+                choice = response.choices[0]
+                content = choice.message.content
+                finish_reason = choice.finish_reason
+                logger.info(f"OpenAI response content: {content[:200] if content else 'None'}...")
+                logger.info(f"Finish reason: {finish_reason}")
+                
+                if content:
+                    return content.strip()
+                else:
+                    logger.warning(f"OpenAI response content is empty. Finish reason: {finish_reason}")
+            else:
+                logger.warning("No choices in OpenAI response")
             
         except NotFoundError:
             logger.error(f"Model '{self.config.openai_model}' not available")
@@ -411,13 +334,6 @@ class AnswerGenerator:
             
         return ""
     
-    def has_citations_in_answer(self, answer: str, hits: List[Dict[str, Any]]) -> bool:
-        """Check if answer contains citations to the provided hits."""
-        if not answer or not hits:
-            return False
-        
-        chunk_ids = [str(hit.get("chunk_id", "")) for hit in hits if hit.get("chunk_id")]
-        return any(chunk_id and chunk_id in answer for chunk_id in chunk_ids)
 
 
 class RAGAnswerer:
@@ -427,7 +343,6 @@ class RAGAnswerer:
         self.config = config or RAGConfig()
         self.retriever = DocumentRetriever(self.config)
         self.generator = AnswerGenerator(self.config)
-        self.extractive = ExtractiveSearch(self.config)
         
         # Validate configuration
         if not self.config.openai_api_key:
@@ -452,76 +367,18 @@ class RAGAnswerer:
             question_type = TextProcessor.detect_question_type(question)
             logger.info(f"Detected question type: {question_type.value}")
             
-            # 3. Try LLM generation first
+            # 3. Generate answer using LLM only
             llm_answer = self.generator.generate_llm_answer(question, hits)
             
-            # 4. Evaluate if we need extractive fallback
-            need_extractive = (
-                not llm_answer or 
-                len(llm_answer.strip()) < self.config.min_answer_length or
-                not self.generator.has_citations_in_answer(llm_answer, hits)
-            )
-            
-            used_hits = []
-            final_answer = ""
-            method = ""
-            
-            if need_extractive:
-                logger.info("Using extractive search approach")
-                
-                # Build extractive answer based on question type
-                bullets = []
-                used_chunk_ids = set()
-                
-                # General sentence extraction
-                sentences = self.extractive.extract_best_sentences(question, hits)
-                for sentence, hit in sentences:
-                    citation = self.generator.format_citation(hit)
-                    bullets.append(f"• {sentence} ({citation})")
-                    
-                    chunk_id = hit.get("chunk_id")
-                    if chunk_id and chunk_id not in used_chunk_ids:
-                        used_chunk_ids.add(chunk_id)
-                        used_hits.append(hit)
-                
-                # Specialized extraction based on question type
-                if question_type == QuestionType.SPEED:
-                    speed_info = self.extractive.extract_speed_info(hits)
-                    for info, hit in speed_info:
-                        citation = self.generator.format_citation(hit)
-                        bullets.append(f"• {info} ({citation})")
-                        
-                        chunk_id = hit.get("chunk_id")
-                        if chunk_id and chunk_id not in used_chunk_ids:
-                            used_chunk_ids.add(chunk_id)
-                            used_hits.append(hit)
-                
-                elif question_type == QuestionType.DEADLINE:
-                    deadline_info = self.extractive.extract_deadline_info(hits)
-                    for info, hit in deadline_info:
-                        citation = self.generator.format_citation(hit)
-                        bullets.append(f"• {info} ({citation})")
-                        
-                        chunk_id = hit.get("chunk_id")
-                        if chunk_id and chunk_id not in used_chunk_ids:
-                            used_chunk_ids.add(chunk_id)
-                            used_hits.append(hit)
-                
-                # Limit bullets and create final answer
-                bullets = bullets[:self.config.max_extractive_bullets]
-                
-                if bullets:
-                    final_answer = f"{PromptTemplates.EXTRACTIVE_INTRO}\n" + "\n".join(bullets)
-                    method = "extractive"
-                else:
-                    final_answer = "Nie udało się znaleźć odpowiedzi w dostarczonych dokumentach."
-                    method = "no_match"
-            
-            else:
+            if llm_answer:
                 logger.info("Using LLM-generated answer")
                 final_answer = llm_answer
                 method = "llm"
                 used_hits = hits[:4]  # Show top hits for LLM answers
+            else:
+                final_answer = "Nie udało się wygenerować odpowiedzi. Sprawdź konfigurację modelu AI."
+                method = "error"
+                used_hits = []
             
             # 5. Add sources section if not already present
             if "Źródła:" not in final_answer:
