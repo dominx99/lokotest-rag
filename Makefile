@@ -149,6 +149,12 @@ retriever: qdrant-health
 	 MERGE_TOPK="$(MERGE_TOPK)" FINAL_K="$(FINAL_K)" RRF_K="$(RRF_K)" \
 	 $(PY) serve_qdrant_retriever.py
 
+.PHONY: kill-retriever
+kill-retriever:
+	@echo "🛑 Killing retriever service..."
+	@pkill -f serve_qdrant_retriever.py || echo "No retriever process found"
+	@echo "✅ Retriever service stopped"
+
 QUESTION ?= What is the speed limit?
 .PHONY: answer
 answer:
