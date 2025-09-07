@@ -18,9 +18,10 @@ from fastapi import FastAPI, Query, HTTPException
 from pydantic import BaseModel, Field
 from openai import OpenAI, BadRequestError, NotFoundError
 
-# Configure logging
+# Configure logging - level can be controlled by environment
+log_level = os.environ.get("LOG_LEVEL", "WARNING").upper()
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, log_level, logging.WARNING),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -39,7 +40,7 @@ class QuestionType(Enum):
 class RAGConfig:
     """Configuration for RAG system."""
     retriever_url: str = os.environ.get("RETRIEVER_URL", "http://127.0.0.1:8000/search")
-    openai_model: str = os.environ.get("RAG_CHAT_MODEL", "gpt-4o-mini")
+    openai_model: str = os.environ.get("RAG_CHAT_MODEL", "gpt-5-mini")
     openai_api_key: str = os.environ.get("OPENAI_API_KEY", "")
     
     # Search parameters
@@ -272,38 +273,26 @@ class AnswerGenerator:
                 response = self.client.chat.completions.create(
                     model=self.config.openai_model,
                     messages=messages,
-                    max_completion_tokens=self.config.max_completion_tokens,
-                    temperature=0.3
+                    max_completion_tokens=self.config.max_completion_tokens
                 )
             except BadRequestError as e:
                 error_str = str(e).lower()
                 logger.warning(f"BadRequestError with max_completion_tokens: {e}")
                 
-                if "max_completion_tokens" in error_str or "unsupported" in error_str:
-                    # Fall back to max_tokens for older models
-                    logger.info("Falling back to max_tokens parameter")
-                    try:
-                        response = self.client.chat.completions.create(
-                            model=self.config.openai_model,
-                            messages=messages,
-                            max_tokens=self.config.max_completion_tokens,
-                            temperature=0.3
-                        )
-                    except BadRequestError as e2:
-                        # Try without temperature
-                        logger.info("Trying without temperature parameter")
-                        response = self.client.chat.completions.create(
-                            model=self.config.openai_model,
-                            messages=messages,
-                            max_tokens=self.config.max_completion_tokens
-                        )
-                elif "model" in error_str and "not found" in error_str:
-                    logger.error(f"Model {self.config.openai_model} not found. Trying gpt-4o-mini as fallback.")
+                if "max_completion_tokens" in error_str or "max_tokens" in error_str:
+                    # gpt-5-mini requires max_completion_tokens without temperature
+                    logger.info("Trying with max_completion_tokens only")
                     response = self.client.chat.completions.create(
-                        model="gpt-4o-mini",
+                        model=self.config.openai_model,
                         messages=messages,
-                        max_tokens=self.config.max_completion_tokens,
-                        temperature=0.3
+                        max_completion_tokens=self.config.max_completion_tokens
+                    )
+                elif "model" in error_str and "not found" in error_str:
+                    logger.error(f"Model {self.config.openai_model} not found. Trying gpt-5-mini as fallback.")
+                    response = self.client.chat.completions.create(
+                        model="gpt-5-mini",
+                        messages=messages,
+                        max_completion_tokens=self.config.max_completion_tokens
                     )
                 else:
                     raise

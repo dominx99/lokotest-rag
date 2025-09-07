@@ -14,7 +14,7 @@ CHUNKS_PATH = Path("rag_prep/data/chunks.jsonl")
 INDEX_DIR   = Path("rag_prep/index")
 INFO_PATH   = INDEX_DIR / "qdrant_info.json"
 
-EMB_MODEL   = os.environ.get("EMB_MODEL", "text-embedding-3-large")
+EMB_MODEL   = os.environ.get("EMB_MODEL")
 EMB_DIM_ENV = os.environ.get("EMB_DIM")
 EMB_DIM     = int(EMB_DIM_ENV) if EMB_DIM_ENV else None
 

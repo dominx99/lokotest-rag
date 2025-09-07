@@ -25,7 +25,7 @@ QDRANT_PORT       ?= 6333
 
 # -------- Models & Parameters --------
 # OpenAI embeddings
-EMB_MODEL ?= text-embedding-3-large
+EMB_MODEL ?= text-embedding-3-small
 EMB_DIM   ?=
 
 # Reranker
@@ -39,7 +39,7 @@ FINAL_K    ?= 10
 RRF_K      ?= 60
 
 # Answering LLM
-RAG_CHAT_MODEL ?= gpt-4o-mini
+RAG_CHAT_MODEL ?= gpt-5-mini
 
 # -------- Default target --------
 .PHONY: help
@@ -77,6 +77,7 @@ help:
 	@echo "  QDRANT_COLLECTION=$(QDRANT_COLLECTION)"
 	@echo "  EMB_MODEL=$(EMB_MODEL) RERANKER=$(RERANKER)"
 	@echo "  VEC_TOPK=$(VEC_TOPK) FINAL_K=$(FINAL_K)"
+	@echo "  LOG_LEVEL=$(LOG_LEVEL) (DEBUG, INFO, WARNING, ERROR)"
 	@echo ""
 
 # -------- Setup --------
@@ -162,7 +163,7 @@ ifndef OPENAI_API_KEY
 	$(error OPENAI_API_KEY is not set)
 endif
 	@echo "❓ Asking: $(QUESTION)"
-	@RAG_CHAT_MODEL="$(RAG_CHAT_MODEL)" $(PY) answer_rag.py "$(QUESTION)"
+	@RAG_CHAT_MODEL="$(RAG_CHAT_MODEL)" LOG_LEVEL="$(LOG_LEVEL)" $(PY) answer_rag.py "$(QUESTION)"
 
 .PHONY: answer-api
 answer-api:
@@ -170,7 +171,7 @@ ifndef OPENAI_API_KEY
 	$(error OPENAI_API_KEY is not set)
 endif
 	@echo "🚀 Starting answer API service..."
-	@RAG_CHAT_MODEL="$(RAG_CHAT_MODEL)" $(PY) answer_rag.py serve
+	@RAG_CHAT_MODEL="$(RAG_CHAT_MODEL)" LOG_LEVEL="$(LOG_LEVEL)" $(PY) answer_rag.py serve
 
 .PHONY: test-retriever
 test-retriever:
@@ -192,7 +193,7 @@ endif
 	@echo "⏳ Waiting for service to start..."
 	@sleep 5
 	@echo "💬 Asking question..."
-	@RAG_CHAT_MODEL="$(RAG_CHAT_MODEL)" $(PY) answer_rag.py "$(QUESTION)" || true
+	@RAG_CHAT_MODEL="$(RAG_CHAT_MODEL)" LOG_LEVEL="$(LOG_LEVEL)" $(PY) answer_rag.py "$(QUESTION)" || true
 	@echo "🛑 Stopping background retriever..."
 	@pkill -f serve_qdrant_retriever.py || true
 

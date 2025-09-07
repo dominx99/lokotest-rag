@@ -70,7 +70,7 @@ export OPENAI_API_KEY="your-openai-api-key"
 export QDRANT_COLLECTION="rag_documents"
 
 # Embedding model
-export EMB_MODEL="text-embedding-3-large"
+export EMB_MODEL="text-embedding-3-small"
 
 # Retrieval parameters  
 export VEC_TOPK=100
@@ -78,7 +78,7 @@ export BM25_TOPK=150
 export FINAL_K=8
 
 # Answer model
-export RAG_CHAT_MODEL="gpt-4o-mini"
+export RAG_CHAT_MODEL="gpt-5-mini"
 ```
 
 ### Key Parameters
@@ -86,9 +86,9 @@ export RAG_CHAT_MODEL="gpt-4o-mini"
 - **QDRANT_URL**: Qdrant Cloud cluster URL
 - **QDRANT_API_KEY**: Qdrant Cloud API key
 - **QDRANT_COLLECTION**: Collection name (default: `rag_documents`)
-- **EMB_MODEL**: OpenAI embedding model (default: `text-embedding-3-large`)
+- **EMB_MODEL**: OpenAI embedding model (default: `text-embedding-3-small`)
 - **RERANKER**: Reranking model (default: `jinaai/jina-reranker-v2-base-multilingual`)
-- **RAG_CHAT_MODEL**: Chat model (default: `gpt-4o-mini`)
+- **RAG_CHAT_MODEL**: Chat model (default: `gpt-5-mini`)
 
 ## 🌐 API Usage
 
