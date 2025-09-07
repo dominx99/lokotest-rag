@@ -37,8 +37,8 @@ services:
     labels:
       - traefik.enable=true
       - traefik.docker.network=proxy
-      - traefik.http.routers.rag_api.rule=Host(`rag.lokotest.pl`)
-      - traefik.http.routers.rag_api.tls.certresolver=lets_encrypt_resolver
+      - traefik.http.routers.rag_api.rule=Host(`rag.docker.localhost`)
+      - traefik.http.routers.rag_api.entrypoints=web
       - traefik.http.services.rag_api.loadbalancer.server.port=8010
     networks:
       internal:

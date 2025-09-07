@@ -1,0 +1,9 @@
+{
+  "model": "text-embedding-3-small",
+  "dim": 1536,
+  "normalized": true,
+  "backend": "qdrant",
+  "collection_name": "rag_documents",
+  "points_count": 1307,
+  "vector_size": 1536
+}
