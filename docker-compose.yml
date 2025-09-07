@@ -1,0 +1,52 @@
+services:
+  rag_retriever:
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: Dockerfile.retriever
+    environment:
+      - QDRANT_URL=${QDRANT_URL}
+      - QDRANT_API_KEY=${QDRANT_API_KEY}
+      - QDRANT_COLLECTION=${QDRANT_COLLECTION:-rag_documents}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - EMB_MODEL=${EMB_MODEL:-text-embedding-3-small}
+      - RERANKER=${RERANKER:-jinaai/jina-reranker-v2-base-multilingual}
+      - VEC_TOPK=${VEC_TOPK:-100}
+      - BM25_TOPK=${BM25_TOPK:-150}
+      - MERGE_TOPK=${MERGE_TOPK:-40}
+      - FINAL_K=${FINAL_K:-8}
+      - RRF_K=${RRF_K:-60}
+    networks:
+      - internal
+
+  rag_answer:
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: Dockerfile.answer
+    environment:
+      - RETRIEVER_URL=http://rag_retriever:8000/search
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - RAG_CHAT_MODEL=${RAG_CHAT_MODEL:-gpt-5-mini}
+      - RAG_TOPK=${RAG_TOPK:-5}
+      - RAG_CHARS_PER_HIT=${RAG_CHARS_PER_HIT:-500}
+      - LOG_LEVEL=${LOG_LEVEL:-WARNING}
+    depends_on:
+      rag_retriever:
+        condition: service_healthy
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=proxy
+      - traefik.http.routers.rag_api.rule=Host(`rag.lokotest.pl`)
+      - traefik.http.routers.rag_api.entrypoints=web
+      - traefik.http.services.rag_api.loadbalancer.server.port=8010
+    networks:
+      internal:
+      proxy:
+        ipv4_address: 10.200.5.6
+
+networks:
+  internal:
+    driver: bridge
+  proxy:
+    external: true

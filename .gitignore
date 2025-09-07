@@ -2,3 +2,7 @@ rag_prep/tmp
 rag_prep/data
 rag_prep/index
 __pycache__/
+.env
+
+answer.json
+.claude/
