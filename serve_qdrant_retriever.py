@@ -12,10 +12,10 @@ from openai import OpenAI
 
 from qdrant_store import get_qdrant_store
 
-INFO_PATH  = Path("rag_prep/index/qdrant_info.json")
+INFO_PATH = Path("rag_prep/index/qdrant_info.json")
 
 # ---------- Tunables ----------
-FINAL_K    = int(os.environ.get("FINAL_K", "8"))
+FINAL_K = int(os.environ.get("FINAL_K", "8"))
 COLLECTION_NAME = os.environ.get("QDRANT_COLLECTION", "rag_documents")
 
 # Initialize components
@@ -28,11 +28,13 @@ qdrant_store = get_qdrant_store(COLLECTION_NAME)
 with open(INFO_PATH, "r", encoding="utf-8") as f:
     info = json.load(f)
 EMB_MODEL = info["model"]
-EMB_DIM   = info["dim"]
-print(f"Embedding backend: Qdrant + OpenAI | model: {EMB_MODEL} | dim: {EMB_DIM}")
+EMB_DIM = info["dim"]
+print(
+    f"Embedding backend: Qdrant + OpenAI | model: {EMB_MODEL} | dim: {EMB_DIM}")
 
 # OpenAI client for query embeddings
 oa_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
 
 def embed_query(q: str) -> np.ndarray:
     """Generate embeddings for query with caching."""
@@ -43,11 +45,12 @@ def embed_query(q: str) -> np.ndarray:
     v = v / np.linalg.norm(v)
     return v
 
+
 def optimized_search(q: str) -> List[Dict[str, Any]]:
     """Optimized search using only text matching and vector search."""
     # Primary: text matching for exact/fuzzy matches
     text_results = qdrant_store.text_search(q, limit=FINAL_K * 2)
-    
+
     if text_results:
         # Process text results
         results = []
@@ -56,29 +59,29 @@ def optimized_search(q: str) -> List[Dict[str, Any]]:
             results.append({
                 "score": float(hit.get("score", 0.0)),
                 "title": payload.get("title"),
-                "source_path": payload.get("source_path"), 
+                "source_path": payload.get("source_path"),
                 "page": payload.get("page"),
                 "chunk_index": payload.get("chunk_index"),
                 "chunk_id": payload.get("chunk_id", ""),
                 "text": payload.get("text", ""),
             })
-        
+
         # If we have good text matches, return them
         if any(r["score"] > 0.5 for r in results):
             return results[:FINAL_K]
-    
+
     # Fallback: vector search
     try:
         qv = embed_query(q)
         vector_hits = qdrant_store.search(query_vector=qv, limit=FINAL_K)
-        
+
         results = []
         for hit in vector_hits:
             results.append({
                 "score": float(hit.get("score", 0.0)),
                 "title": hit.get("title"),
                 "source_path": hit.get("source_path"),
-                "page": hit.get("page"), 
+                "page": hit.get("page"),
                 "chunk_index": hit.get("chunk_index"),
                 "chunk_id": hit.get("chunk_id", ""),
                 "text": hit.get("text", ""),
@@ -89,6 +92,8 @@ def optimized_search(q: str) -> List[Dict[str, Any]]:
         return text_results[:FINAL_K] if text_results else []
 
 # ---------- CLI ----------
+
+
 def cli_once():
     try:
         q = input("Zapytanie: ").strip()
@@ -106,6 +111,8 @@ def cli_once():
         pass
 
 # ---------- HTTP ----------
+
+
 class Hit(BaseModel):
     score: float
     title: str | None
@@ -115,16 +122,20 @@ class Hit(BaseModel):
     chunk_id: str
     text: str
 
+
 class SearchResponse(BaseModel):
     query: str
     hits: List[Hit]
 
+
 app = FastAPI(title="RAG Retriever (Optimized) — Qdrant + OpenAI embeddings")
+
 
 @app.get("/search", response_model=SearchResponse)
 def search(q: str = Query(..., description="Polskie zapytanie")):
     hits = optimized_search(q)
     return {"query": q, "hits": hits}
+
 
 if __name__ == "__main__":
     import sys
