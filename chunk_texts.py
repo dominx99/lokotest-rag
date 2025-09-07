@@ -75,21 +75,47 @@ def soft_units(paragraph: str) -> List[str]:
         merged.append(buf)
     return merged
 
-def greedy_pack(units: List[str], max_tokens: int) -> List[List[str]]:
+def semantic_pack(units: List[str], max_tokens: int) -> List[List[str]]:
     """
-    Pack units into chunks not exceeding max_tokens.
+    Pack units into chunks respecting semantic boundaries (paragraphs).
     """
     chunks, cur, cur_tokens = [], [], 0
-    for u in units:
+    
+    i = 0
+    while i < len(units):
+        u = units[i]
         t = token_len(u)
+        
+        # If this would exceed the limit and we have content
         if cur and cur_tokens + t > max_tokens:
-            chunks.append(cur)
-            cur, cur_tokens = [], 0
+            # Look ahead to see if there's a natural break point soon
+            lookahead = 3
+            found_boundary = False
+            
+            for j in range(i, min(i + lookahead, len(units))):
+                if "\n\n" in units[j]:  # paragraph boundary
+                    found_boundary = True
+                    break
+            
+            # If we found a boundary soon or current chunk is large enough, split now
+            if found_boundary or cur_tokens > max_tokens * 0.6:
+                chunks.append(cur)
+                cur, cur_tokens = [], 0
+        
         cur.append(u)
         cur_tokens += t
+        i += 1
+    
     if cur:
         chunks.append(cur)
     return chunks
+
+def greedy_pack(units: List[str], max_tokens: int) -> List[List[str]]:
+    """
+    Pack units into chunks not exceeding max_tokens, respecting paragraph boundaries.
+    """
+    # Use semantic packing by default
+    return semantic_pack(units, max_tokens)
 
 def sliding_overlap(chunks: List[List[str]], overlap_tokens: int) -> List[str]:
     out = []
@@ -135,13 +161,18 @@ def page_to_chunks(rec: Dict[str, Any]) -> List[Dict[str, Any]]:
     if buf:
         blocks.append("\n".join(buf).strip())
 
-    # Further split blocks into sentence-like units
+    # Further split blocks into paragraph-aware units
     units: List[str] = []
     for b in blocks:
         # split by double newline (paragraphs)
         paras = [p.strip() for p in b.split("\n\n") if p.strip()]
-        for p in paras:
-            units.extend(soft_units(p))
+        for i, p in enumerate(paras):
+            # Keep paragraph markers for boundary detection
+            paragraph_units = soft_units(p)
+            # Add paragraph separator to last unit (except for last paragraph)
+            if paragraph_units and i < len(paras) - 1:
+                paragraph_units[-1] += "\n\n"
+            units.extend(paragraph_units)
 
     # Pack into chunks with overlap
     packed = greedy_pack(units, TARGET_TOKENS)

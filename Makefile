@@ -62,6 +62,7 @@ help:
 	@echo "  answer          - one-shot RAG answer (use QUESTION=\"...\")"
 	@echo "  answer-api      - start answer API on :8010"
 	@echo "  qa              - ask question with auto-start retriever (experimental)"
+	@echo "  test-retriever  - test what retriever returns (use QUESTION=\"...\")"
 	@echo ""
 	@echo "Testing:"
 	@echo "  test-search     - test direct Qdrant search"
@@ -155,12 +156,6 @@ ifndef OPENAI_API_KEY
 	$(error OPENAI_API_KEY is not set)
 endif
 	@echo "❓ Asking: $(QUESTION)"
-	@echo "🔍 Checking if retriever service is running..."
-	@curl -s http://localhost:8000/search?q=test >/dev/null 2>&1 || \
-		(echo "❌ Retriever service not running on :8000"; \
-		 echo "💡 Start it with: make retriever"; \
-		 exit 1)
-	@echo "✅ Retriever service is running"
 	@RAG_CHAT_MODEL="$(RAG_CHAT_MODEL)" $(PY) answer_rag.py "$(QUESTION)"
 
 .PHONY: answer-api
@@ -170,6 +165,11 @@ ifndef OPENAI_API_KEY
 endif
 	@echo "🚀 Starting answer API service..."
 	@RAG_CHAT_MODEL="$(RAG_CHAT_MODEL)" $(PY) answer_rag.py serve
+
+.PHONY: test-retriever
+test-retriever:
+	@echo "🔍 Testing retriever with: $(QUESTION)"
+	@curl -s "http://localhost:8000/search?q=$(shell python -c "import urllib.parse; print(urllib.parse.quote('$(QUESTION)'))")" | python -m json.tool
 
 # Experimental: Ask question with auto-start retriever (runs in background)
 .PHONY: qa
