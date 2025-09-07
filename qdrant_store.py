@@ -7,7 +7,7 @@ import numpy as np
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import (
     Distance, VectorParams, CreateCollection, PointStruct, 
-    Filter, FieldCondition, SearchRequest
+    Filter, FieldCondition, SearchRequest, MatchText
 )
 
 
@@ -137,6 +137,55 @@ class QdrantVectorStore:
             hits.append(hit)
         
         return hits
+    
+    def text_search(
+        self, 
+        query_text: str, 
+        limit: int = 10,
+        text_field: str = "text"
+    ) -> List[Dict[str, Any]]:
+        """Search for text matches in documents."""
+        # Create text match filter
+        text_filter = Filter(
+            must=[
+                FieldCondition(
+                    key=text_field,
+                    match=MatchText(text=query_text)
+                )
+            ]
+        )
+        
+        # Use scroll to get filtered results
+        results, _ = self.client.scroll(
+            collection_name=self.collection_name,
+            scroll_filter=text_filter,
+            limit=limit,
+            with_payload=True
+        )
+        
+        # Format results with artificial score based on exact match
+        hits = []
+        for result in results:
+            # Simple score based on how well the text matches
+            text_content = result.payload.get(text_field, "").lower()
+            query_lower = query_text.lower()
+            
+            # Higher score for exact matches
+            if query_lower in text_content:
+                score = 1.0 if query_lower == text_content.strip() else 0.9
+            else:
+                score = 0.5
+            
+            hit = {
+                "id": result.id,
+                "score": score,
+                "payload": result.payload
+            }
+            hits.append(hit)
+        
+        # Sort by score descending
+        hits.sort(key=lambda x: x["score"], reverse=True)
+        return hits[:limit]
     
     def get_collection_info(self) -> Dict[str, Any]:
         """Get information about the collection."""

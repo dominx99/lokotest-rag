@@ -160,39 +160,39 @@ def get_texts_for_chunk_ids(chunk_ids: List[str]) -> Dict[str, str]:
     
     return texts
 
-def merge_and_rerank(q: str) -> List[Dict[str, Any]]:
-    """Merge vector and BM25 search results, then rerank."""
-    vec = vec_search(q, VEC_TOPK)
-    bm  = bm25_search(q, BM25_TOPK)
-
-    vec_ids = [chunk_id for chunk_id, _ in vec]
-    bm_ids  = [chunk_id for chunk_id, _ in bm]
-
-    # RRF fusion
-    fused_scores = rrf([vec_ids, bm_ids], k=RRF_K)
-    fused_sorted = sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)[:MERGE_TOPK]
-    cand_ids = [chunk_id for chunk_id, _ in fused_sorted]
-
-    # Get texts for reranking
-    texts = get_texts_for_chunk_ids(cand_ids)
-    pairs = [(q, texts.get(chunk_id, "")) for chunk_id in cand_ids]
-
-    # Rerank
-    try:
-        scores = reranker.compute_score(pairs, batch_size=8)
-    except Exception:
-        q_emb = reranker.encode([q], normalize_embeddings=True)
-        p_emb = reranker.encode([t for _, t in pairs], normalize_embeddings=True)
-        scores = (q_emb @ p_emb.T)[0].tolist()
-
-    ranked = sorted(zip(cand_ids, scores), key=lambda x: x[1], reverse=True)[:FINAL_K]
-
-    # Get full metadata for final results from cache or direct search
-    results = []
-    missing_chunks = []
+def text_match_search(q: str, limit: int = 20) -> List[Dict[str, Any]]:
+    """Direct text matching search like the working Qdrant query."""
+    hits = qdrant_store.text_search(q, limit=limit)
     
-    # First try from cache
-    for chunk_id, score in ranked:
+    results = []
+    for hit in hits:
+        payload = hit.get("payload", {})
+        results.append({
+            "score": float(hit.get("score", 0.0)),
+            "title": payload.get("title"),
+            "source_path": payload.get("source_path"),
+            "page": payload.get("page"),
+            "chunk_index": payload.get("chunk_index"),
+            "chunk_id": payload.get("chunk_id", ""),
+            "text": payload.get("text", ""),
+        })
+    
+    return results
+
+def merge_and_rerank(q: str) -> List[Dict[str, Any]]:
+    """Simplified search: prioritize text matching, fallback to vector search."""
+    # First try text matching (like the working Qdrant query)
+    text_results = text_match_search(q, limit=FINAL_K)
+    
+    # If we get good text matches, use them
+    if text_results and any(r["score"] > 0.8 for r in text_results):
+        return text_results[:FINAL_K]
+    
+    # Fallback to vector search only
+    vec_results = vec_search(q, FINAL_K)
+    results = []
+    
+    for chunk_id, score in vec_results:
         if chunk_id in metadata_cache:
             metadata = metadata_cache[chunk_id]
             results.append({
@@ -204,33 +204,6 @@ def merge_and_rerank(q: str) -> List[Dict[str, Any]]:
                 "chunk_id": metadata.get("chunk_id"),
                 "text": metadata.get("text", ""),
             })
-        else:
-            missing_chunks.append((chunk_id, score))
-    
-    # Handle missing chunks with direct search
-    if missing_chunks:
-        try:
-            all_points = qdrant_store.scroll_all_points()
-            chunk_metadata = {}
-            for point in all_points:
-                payload_chunk_id = point["payload"].get("chunk_id")
-                if payload_chunk_id:
-                    chunk_metadata[payload_chunk_id] = point["payload"]
-            
-            for chunk_id, score in missing_chunks:
-                if chunk_id in chunk_metadata:
-                    metadata = chunk_metadata[chunk_id]
-                    results.append({
-                        "score": float(score),
-                        "title": metadata.get("title"),
-                        "source_path": metadata.get("source_path"),
-                        "page": metadata.get("page"),
-                        "chunk_index": metadata.get("chunk_index"),
-                        "chunk_id": metadata.get("chunk_id"),
-                        "text": metadata.get("text", ""),
-                    })
-        except Exception as e:
-            print(f"Warning: Could not retrieve missing metadata: {e}")
     
     return results
 
