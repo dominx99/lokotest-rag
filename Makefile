@@ -39,7 +39,7 @@ FINAL_K    ?= 8
 RRF_K      ?= 60
 
 # Answering LLM
-RAG_CHAT_MODEL ?= gpt-4o-mini
+RAG_CHAT_MODEL ?= gpt-5
 
 # -------- Default target --------
 .PHONY: help
@@ -66,9 +66,6 @@ help:
 	@echo "Testing:"
 	@echo "  test-search     - test direct Qdrant search"
 	@echo "  test-integration - full integration test"
-	@echo ""
-	@echo "Migration:"
-	@echo "  migrate         - migrate existing FAISS index to Qdrant"
 	@echo ""
 	@echo "Cleanup:"
 	@echo "  clean-index     - remove indexes"
@@ -141,16 +138,6 @@ rebuild: prep chunk index bm25
 quick-rebuild: chunk index bm25
 	@echo "🎉 Quick rebuild finished!"
 
-# -------- Migration --------
-.PHONY: migrate
-migrate: qdrant-health
-ifndef OPENAI_API_KEY
-	$(error OPENAI_API_KEY is not set)
-endif
-	@echo "🔄 Migrating FAISS index to Qdrant..."
-	@QDRANT_URL="$(QDRANT_URL)" QDRANT_API_KEY="$(QDRANT_API_KEY)" QDRANT_COLLECTION="$(QDRANT_COLLECTION)" \
-	 $(PY) migrate_to_qdrant.py
-	@echo "✅ Migration complete"
 
 # -------- Services --------
 .PHONY: retriever
