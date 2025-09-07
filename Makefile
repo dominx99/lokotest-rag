@@ -1,12 +1,10 @@
-# Makefile — Recreate the full RAG pipeline end-to-end
+# Makefile — Qdrant-based RAG pipeline
 # Usage examples:
 #   make help
-#   make venv deps
-#   make prep chunk embed bm25          # full (re)build
-#   make retriever                      # start retriever API (port 8000)
-#   make retriever-once                 # single interactive query in CLI
-#   make answer QUESTION="Posterunek techniczny"
-#   make answer-api                     # start answer API (port 8010)
+#   make deps
+#   make rebuild
+#   make retriever
+#   make answer QUESTION="..."
 
 # -------- Paths --------
 PY        := .venv/bin/python
@@ -15,160 +13,246 @@ RAW_PDFS  := rag_prep/raw_pdfs
 DATA_DIR  := rag_prep/data
 INDEX_DIR := rag_prep/index
 
-# -------- Models & knobs (override with: make embed EMB_MODEL=... ) --------
-# OpenAI embeddings (used by build_index.py)
+# -------- Qdrant Configuration --------
+# Qdrant Cloud (recommended - set these in your environment):
+QDRANT_URL        ?= 
+QDRANT_API_KEY    ?= 
+QDRANT_COLLECTION ?= rag_documents
+
+# For self-hosted Qdrant (only if not using cloud):
+QDRANT_HOST       ?= localhost
+QDRANT_PORT       ?= 6333
+
+# -------- Models & Parameters --------
+# OpenAI embeddings
 EMB_MODEL ?= text-embedding-3-large
-# EMB_DIM is optional; if set, must be valid for the chosen model (e.g., 3072 or 1536)
 EMB_DIM   ?=
 
-# Reranker (no-custom-code multilingual by default)
-RERANKER  ?= Alibaba-NLP/gte-multilingual-reranker-base
-# If you prefer Jina (requires trust_remote_code): RERANKER=jinaai/jina-reranker-v2-base-multilingual
+# Reranker
+RERANKER  ?= jinaai/jina-reranker-v2-base-multilingual
 
-# Hybrid recall (increase if you miss “needle” facts like 20 km/h)
+# Hybrid search parameters
 VEC_TOPK   ?= 100
 BM25_TOPK  ?= 150
 MERGE_TOPK ?= 40
 FINAL_K    ?= 8
 RRF_K      ?= 60
 
-# Answering LLM (OpenAI Chat)
-RAG_CHAT_MODEL ?= gpt-5-mini
+# Answering LLM
+RAG_CHAT_MODEL ?= gpt-4o-mini
 
 # -------- Default target --------
 .PHONY: help
 help:
 	@echo ""
-	@echo "Targets:"
-	@echo "  venv            - create Python venv (.venv)"
-	@echo "  deps            - install Python dependencies into venv"
-	@echo "  prep            - extract text/images from PDFs  -> $(DATA_DIR)/pages.jsonl"
-	@echo "  chunk           - chunk pages                     -> $(DATA_DIR)/chunks.jsonl"
-	@echo "  embed           - build FAISS (OpenAI embeddings) -> $(INDEX_DIR)/faiss.index"
-	@echo "  bm25            - build BM25 (tokenizer keeps numbers & km/h) -> $(INDEX_DIR)/bm25.pkl"
-	@echo "  rebuild         - prep + chunk + embed + bm25"
-	@echo "  quick-rebuild   - chunk + embed + bm25 (if PDFs didn’t change)"
-	@echo "  retriever       - run retriever API on :8000"
-	@echo "  retriever-once  - one-shot CLI retrieval test"
-	@echo "  answer          - run one-shot RAG answer (use QUESTION=\"...\")"
-	@echo "  answer-api      - run answer API on :8010"
-	@echo "  clean-index     - remove vector/BM25 indexes"
+	@echo "🚀 Qdrant-based RAG Pipeline"
 	@echo ""
-	@echo "Variables (override via 'make target VAR=value'):"
-	@echo "  EMB_MODEL=$(EMB_MODEL)  EMB_DIM=$(EMB_DIM)"
-	@echo "  RERANKER=$(RERANKER)"
-	@echo "  VEC_TOPK=$(VEC_TOPK)  BM25_TOPK=$(BM25_TOPK)  MERGE_TOPK=$(MERGE_TOPK)  FINAL_K=$(FINAL_K)  RRF_K=$(RRF_K)"
-	@echo "  RAG_CHAT_MODEL=$(RAG_CHAT_MODEL)"
+	@echo "Setup:"
+	@echo "  deps            - install dependencies"
+	@echo "  qdrant-health   - check Qdrant cloud connection"
 	@echo ""
-	@echo "Note: You don't need 'source .venv/bin/activate.fish' inside Make; we call $(PY)/$(PIP) directly."
+	@echo "Data Pipeline:"
+	@echo "  prep            - extract text from PDFs -> $(DATA_DIR)/pages.jsonl"
+	@echo "  chunk           - chunk pages -> $(DATA_DIR)/chunks.jsonl"
+	@echo "  index           - build Qdrant collection"
+	@echo "  rebuild         - prep + chunk + index + bm25"
+	@echo ""
+	@echo "Services:"
+	@echo "  retriever       - start retriever API on :8000"
+	@echo "  answer          - one-shot RAG answer (use QUESTION=\"...\")"
+	@echo "  answer-api      - start answer API on :8010"
+	@echo "  qa              - ask question with auto-start retriever (experimental)"
+	@echo ""
+	@echo "Testing:"
+	@echo "  test-search     - test direct Qdrant search"
+	@echo "  test-integration - full integration test"
+	@echo ""
+	@echo "Migration:"
+	@echo "  migrate         - migrate existing FAISS index to Qdrant"
+	@echo ""
+	@echo "Cleanup:"
+	@echo "  clean-index     - remove indexes"
+	@echo "  clean-all       - clean everything"
+	@echo ""
+	@echo "Environment Variables:"
+	@echo "  QDRANT_URL=$(QDRANT_URL)"
+	@echo "  QDRANT_COLLECTION=$(QDRANT_COLLECTION)"
+	@echo "  EMB_MODEL=$(EMB_MODEL) RERANKER=$(RERANKER)"
+	@echo "  VEC_TOPK=$(VEC_TOPK) FINAL_K=$(FINAL_K)"
+	@echo ""
 
-# -------- Environment / deps --------
-.PHONY: venv
-venv:
-	@test -d .venv || python -m venv .venv
-	@echo "✅ venv ready: .venv"
+# -------- Setup --------
+.venv:
+	python -m venv .venv
+	@echo "✅ Virtual environment created"
 
 .PHONY: deps
-deps: venv
+deps: .venv
 	@$(PY) -m pip install --upgrade pip
-	@echo "📦 writing requirements.txt"
-	@echo "python-dateutil" > requirements.txt
-	@echo "pymupdf" >> requirements.txt
-	@echo "pdf2image" >> requirements.txt
-	@echo "pytesseract" >> requirements.txt
-	@echo "Pillow" >> requirements.txt
-	@echo "tqdm" >> requirements.txt
-	@echo "regex" >> requirements.txt
-	@echo "tiktoken" >> requirements.txt
-	@echo "sentence-transformers>=3.0" >> requirements.txt
-	@echo "faiss-cpu" >> requirements.txt
-	@echo "torch>=2.2" >> requirements.txt
-	@echo "rank-bm25" >> requirements.txt
-	@echo "fastapi" >> requirements.txt
-	@echo "uvicorn" >> requirements.txt
-	@echo "pydantic" >> requirements.txt
-	@echo "numpy" >> requirements.txt
-	@echo "scikit-learn" >> requirements.txt
-	@echo "scipy" >> requirements.txt
-	@echo "httpx" >> requirements.txt
-	@echo "openai" >> requirements.txt
-	@echo "einops" >> requirements.txt
-	@echo "sentencepiece" >> requirements.txt
 	@$(PIP) install -r requirements.txt
-	@echo "✅ deps installed"
+	@echo "✅ Dependencies installed"
 
-# -------- Pipeline --------
-# 1) Prepare PDFs -> pages.jsonl (and page images for OCR fallback)
+.PHONY: qdrant-health
+qdrant-health:
+	@echo "🔍 Checking Qdrant connection..."
+ifndef QDRANT_URL
+	@echo "❌ QDRANT_URL not set. Please set your Qdrant Cloud URL."
+	@echo "   Example: export QDRANT_URL='https://your-cluster.qdrant.io'"
+	@exit 1
+endif
+ifndef QDRANT_API_KEY
+	@echo "❌ QDRANT_API_KEY not set. Please set your Qdrant API key."
+	@exit 1
+endif
+	@$(PY) -c "from qdrant_store import get_qdrant_store; store = get_qdrant_store('$(QDRANT_COLLECTION)'); print('✅ Qdrant connection successful')" || echo "❌ Qdrant connection failed"
+
+# -------- Data Pipeline --------
 .PHONY: prep
 prep:
 	@test -d $(RAW_PDFS) || (echo "❌ Missing $(RAW_PDFS). Put PDFs there."; exit 1)
 	@$(PY) prep_pdfs.py
-	@echo "✅ prep done -> $(DATA_DIR)/pages.jsonl"
+	@echo "✅ PDF preparation complete -> $(DATA_DIR)/pages.jsonl"
 
-# 2) Chunk pages -> chunks.jsonl
 .PHONY: chunk
 chunk:
 	@$(PY) chunk_texts.py
-	@echo "✅ chunk done -> $(DATA_DIR)/chunks.jsonl"
+	@echo "✅ Text chunking complete -> $(DATA_DIR)/chunks.jsonl"
 
-# 3) Build FAISS with OpenAI embeddings (reads chunks.jsonl)
-.PHONY: embed
-embed:
+.PHONY: index
+index: qdrant-health
 ifndef OPENAI_API_KEY
 	$(error OPENAI_API_KEY is not set)
 endif
-	@EMB_MODEL="$(EMB_MODEL)" EMB_DIM="$(EMB_DIM)" $(PY) build_index.py
-	@echo "✅ FAISS built -> $(INDEX_DIR)/faiss.index"
+	@echo "🚀 Building Qdrant collection '$(QDRANT_COLLECTION)'..."
+	@QDRANT_URL="$(QDRANT_URL)" QDRANT_API_KEY="$(QDRANT_API_KEY)" QDRANT_COLLECTION="$(QDRANT_COLLECTION)" \
+	 EMB_MODEL="$(EMB_MODEL)" EMB_DIM="$(EMB_DIM)" $(PY) build_qdrant_index.py
+	@echo "✅ Qdrant collection built"
 
-# 4) Build BM25 with number/unit-aware tokenizer
 .PHONY: bm25
 bm25:
 	@$(PY) build_bm25.py
-	@echo "✅ BM25 built -> $(INDEX_DIR)/bm25.pkl"
+	@echo "✅ BM25 index built -> $(INDEX_DIR)/bm25.pkl"
 
-# Convenience bundles
 .PHONY: rebuild
-rebuild: prep chunk embed bm25
-	@echo "✅ Rebuild complete."
+rebuild: prep chunk index bm25
+	@echo "🎉 Complete rebuild finished!"
 
 .PHONY: quick-rebuild
-quick-rebuild: chunk embed bm25
-	@echo "✅ Quick rebuild complete."
+quick-rebuild: chunk index bm25
+	@echo "🎉 Quick rebuild finished!"
 
-# -------- Serving / Testing --------
-# Start retriever API (FastAPI on :8000)
+# -------- Migration --------
+.PHONY: migrate
+migrate: qdrant-health
+ifndef OPENAI_API_KEY
+	$(error OPENAI_API_KEY is not set)
+endif
+	@echo "🔄 Migrating FAISS index to Qdrant..."
+	@QDRANT_URL="$(QDRANT_URL)" QDRANT_API_KEY="$(QDRANT_API_KEY)" QDRANT_COLLECTION="$(QDRANT_COLLECTION)" \
+	 $(PY) migrate_to_qdrant.py
+	@echo "✅ Migration complete"
+
+# -------- Services --------
 .PHONY: retriever
-retriever:
-	@RERANKER="$(RERANKER)" \
-	VEC_TOPK="$(VEC_TOPK)" BM25_TOPK="$(BM25_TOPK)" MERGE_TOPK="$(MERGE_TOPK)" FINAL_K="$(FINAL_K)" RRF_K="$(RRF_K)" \
-	$(PY) serve_retriever.py
+retriever: qdrant-health
+	@echo "🚀 Starting Qdrant retriever service..."
+	@QDRANT_URL="$(QDRANT_URL)" QDRANT_API_KEY="$(QDRANT_API_KEY)" QDRANT_COLLECTION="$(QDRANT_COLLECTION)" \
+	 RERANKER="$(RERANKER)" VEC_TOPK="$(VEC_TOPK)" BM25_TOPK="$(BM25_TOPK)" \
+	 MERGE_TOPK="$(MERGE_TOPK)" FINAL_K="$(FINAL_K)" RRF_K="$(RRF_K)" \
+	 $(PY) serve_qdrant_retriever.py
 
-# One-shot CLI retrieval test (prompts for 'Zapytanie:')
-.PHONY: retriever-once
-retriever-once:
-	@RERANKER="$(RERANKER)" \
-	VEC_TOPK="$(VEC_TOPK)" BM25_TOPK="$(BM25_TOPK)" MERGE_TOPK="$(MERGE_TOPK)" FINAL_K="$(FINAL_K)" RRF_K="$(RRF_K)" \
-	$(PY) serve_retriever.py --once
-
-# One-shot answer (requires retriever running separately)
-QUESTION ?= Posterunek techniczny
+QUESTION ?= What is the speed limit?
 .PHONY: answer
 answer:
 ifndef OPENAI_API_KEY
 	$(error OPENAI_API_KEY is not set)
 endif
+	@echo "❓ Asking: $(QUESTION)"
+	@echo "🔍 Checking if retriever service is running..."
+	@curl -s http://localhost:8000/search?q=test >/dev/null 2>&1 || \
+		(echo "❌ Retriever service not running on :8000"; \
+		 echo "💡 Start it with: make retriever"; \
+		 exit 1)
+	@echo "✅ Retriever service is running"
 	@RAG_CHAT_MODEL="$(RAG_CHAT_MODEL)" $(PY) answer_rag.py "$(QUESTION)"
 
-# Run answer API (FastAPI on :8010)
 .PHONY: answer-api
 answer-api:
 ifndef OPENAI_API_KEY
 	$(error OPENAI_API_KEY is not set)
 endif
+	@echo "🚀 Starting answer API service..."
 	@RAG_CHAT_MODEL="$(RAG_CHAT_MODEL)" $(PY) answer_rag.py serve
+
+# Experimental: Ask question with auto-start retriever (runs in background)
+.PHONY: qa
+qa: qdrant-health
+ifndef OPENAI_API_KEY
+	$(error OPENAI_API_KEY is not set)
+endif
+	@echo "❓ Quick Q&A: $(QUESTION)"
+	@echo "🚀 Starting retriever service in background..."
+	@QDRANT_URL="$(QDRANT_URL)" QDRANT_API_KEY="$(QDRANT_API_KEY)" QDRANT_COLLECTION="$(QDRANT_COLLECTION)" \
+	 RERANKER="$(RERANKER)" VEC_TOPK="$(VEC_TOPK)" BM25_TOPK="$(BM25_TOPK)" \
+	 MERGE_TOPK="$(MERGE_TOPK)" FINAL_K="$(FINAL_K)" RRF_K="$(RRF_K)" \
+	 $(PY) serve_qdrant_retriever.py &
+	@echo "⏳ Waiting for service to start..."
+	@sleep 5
+	@echo "💬 Asking question..."
+	@RAG_CHAT_MODEL="$(RAG_CHAT_MODEL)" $(PY) answer_rag.py "$(QUESTION)" || true
+	@echo "🛑 Stopping background retriever..."
+	@pkill -f serve_qdrant_retriever.py || true
+
+# -------- Testing --------
+.PHONY: test-search
+test-search: qdrant-health
+ifndef OPENAI_API_KEY
+	$(error OPENAI_API_KEY is not set)
+endif
+	@echo "🔍 Testing direct Qdrant search..."
+	@QDRANT_URL="$(QDRANT_URL)" QDRANT_API_KEY="$(QDRANT_API_KEY)" QDRANT_COLLECTION="$(QDRANT_COLLECTION)" \
+	 $(PY) search_once_qdrant.py
+
+.PHONY: test-integration
+test-integration: qdrant-health
+	@echo "🧪 Running integration tests..."
+	@QDRANT_URL="$(QDRANT_URL)" QDRANT_API_KEY="$(QDRANT_API_KEY)" QDRANT_COLLECTION="$(QDRANT_COLLECTION)" \
+	 $(PY) test_qdrant_integration.py
 
 # -------- Cleanup --------
 .PHONY: clean-index
 clean-index:
-	@rm -f $(INDEX_DIR)/faiss.index $(INDEX_DIR)/bm25.pkl $(INDEX_DIR)/index_info.json
-	@echo "🧹 Removed indexes in $(INDEX_DIR)"
+	@echo "🧹 Removing indexes..."
+	@rm -f $(INDEX_DIR)/qdrant_info.json $(INDEX_DIR)/bm25.pkl
+	@echo "✅ Local indexes removed"
+	@echo "⚠️  Note: Qdrant collection '$(QDRANT_COLLECTION)' still exists"
+	@echo "   To remove: make clean-qdrant"
+
+.PHONY: clean-qdrant
+clean-qdrant: qdrant-health
+	@echo "🧹 Removing Qdrant collection '$(QDRANT_COLLECTION)'..."
+	@QDRANT_URL="$(QDRANT_URL)" QDRANT_API_KEY="$(QDRANT_API_KEY)" QDRANT_COLLECTION="$(QDRANT_COLLECTION)" \
+	 $(PY) -c "from qdrant_store import get_qdrant_store; get_qdrant_store('$(QDRANT_COLLECTION)').delete_collection()"
+	@echo "✅ Qdrant collection removed"
+
+.PHONY: clean-all
+clean-all: clean-index clean-qdrant
+	@rm -rf $(DATA_DIR)/chunks.jsonl $(DATA_DIR)/pages.jsonl
+	@rm -rf rag_prep/tmp/*
+	@echo "🧹 Complete cleanup finished"
+
+# -------- Development --------
+.PHONY: shell
+shell:
+	@$(PY)
+
+.PHONY: status
+status: qdrant-health
+	@echo ""
+	@echo "📊 System Status:"
+	@echo "  Qdrant: $(QDRANT_URL)"
+	@echo "  Collection: $(QDRANT_COLLECTION)"
+	@echo "  Data files:"
+	@ls -la $(DATA_DIR)/*.jsonl 2>/dev/null || echo "    No data files found"
+	@echo "  Index files:"
+	@ls -la $(INDEX_DIR)/* 2>/dev/null || echo "    No index files found"

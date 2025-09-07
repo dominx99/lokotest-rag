@@ -1,328 +1,624 @@
+#!/usr/bin/env python3
+"""
+Refactored RAG Answer System
+Improved structure, error handling, and response quality.
+"""
+
 import os
 import sys
+import logging
+from typing import List, Dict, Any, Tuple, Set, Optional
+from dataclasses import dataclass
+from enum import Enum
+import json
+
 import httpx
-from typing import List, Dict, Any, Tuple, Set
-from fastapi import FastAPI, Query
-from pydantic import BaseModel
+import regex as re
+from fastapi import FastAPI, Query, HTTPException
+from pydantic import BaseModel, Field
 from openai import OpenAI, BadRequestError, NotFoundError
-import regex as re  # << używamy 'regex' (obsługuje \p{...})
 
-# ------------------- Config -------------------
-RETRIEVER_URL = os.environ.get("RETRIEVER_URL", "http://127.0.0.1:8000/search")
-OPENAI_MODEL  = os.environ.get("RAG_CHAT_MODEL", "gpt-5")  # podmień na realnie dostępny, np. 'gpt-4o-mini'
-TOP_K         = int(os.environ.get("RAG_TOPK", "5"))        # 8 -> 5 (krótszy, trafniejszy kontekst)
-# krótkie fragmenty, żeby model trzymał się sedna:
-CHARS_PER_HIT = int(os.environ.get("RAG_CHARS_PER_HIT", "500"))  # 1000 -> 500
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """Jesteś asystentem RAG odpowiadającym po polsku.
-Zasady (stosuj rygorystycznie):
-- Najpierw zwięzła odpowiedź: MAKS. 5 punktorów LUB 80–120 słów (jeśli punktorów nie da się użyć).
-- Następnie sekcja „Źródła:” (tylko cytowane miejsca).
-- Cytuj dokładne miejsca (tytuł, strona, chunk_id).
-- Jeśli pytanie brzmi „co i w której instrukcji…”, wskaż nazwę dokumentu, paragraf/rozdział i stronę.
-- Jeśli to procedura: wypunktuj kroki (maks. 7).
-- Jeśli brakuje danych w źródłach, powiedz to wprost i zasugeruj doprecyzowanie.
-- Nie wymyślaj faktów — korzystaj wyłącznie z dostarczonych fragmentów.
-- Zawsze odpowiadaj krótko i konkretnie, unikaj dygresji i powtórzeń.
-"""
 
-USER_TEMPLATE = """Pytanie:
-{question}
+class QuestionType(Enum):
+    """Types of questions for specialized handling."""
+    GENERAL = "general"
+    SPEED = "speed"
+    DEADLINE = "deadline"
+    DEFINITION = "definition"
+    PROCEDURE = "procedure"
 
-Dostępne źródła (skrót wycinków):
+
+@dataclass
+class RAGConfig:
+    """Configuration for RAG system."""
+    retriever_url: str = os.environ.get("RETRIEVER_URL", "http://127.0.0.1:8000/search")
+    openai_model: str = os.environ.get("RAG_CHAT_MODEL", "gpt-4o-mini")
+    openai_api_key: str = os.environ.get("OPENAI_API_KEY", "")
+    
+    # Search parameters
+    top_k: int = int(os.environ.get("RAG_TOPK", "5"))
+    chars_per_hit: int = int(os.environ.get("RAG_CHARS_PER_HIT", "600"))
+    
+    # Response limits
+    max_completion_tokens: int = 300
+    max_extractive_bullets: int = 8
+    max_sentences_per_hit: int = 2
+    
+    # Context window management
+    context_overlap_threshold: float = 0.15
+    min_answer_length: int = 30
+
+
+class PromptTemplates:
+    """Improved prompt templates for better responses."""
+    
+    SYSTEM_PROMPT = """Jesteś ekspertem RAG odpowiadającym precyzyjnie po polsku na podstawie dostarczonych źródeł.
+
+ZASADY ODPOWIADANIA:
+1. STRUKTURA: Zwięzła odpowiedź (maks. 5 punktów LUB 100-150 słów) + sekcja "Źródła:"
+2. DOKŁADNOŚĆ: Używaj TYLKO informacji z dostarczonych fragmentów
+3. CYTOWANIE: Zawsze podaj konkretne źródła (dokument, strona, ID chunka)
+4. PRZEJRZYSTOŚĆ: Jeśli informacje są niepełne, wskaż czego brakuje
+5. SPECJALIZACJA: 
+   - Procedury → wypunktuj kroki (maks. 7)
+   - Definicje → podaj źródło i kontekst
+   - Prędkości/terminy → cytuj dokładne wartości
+6. JĘZYK: Używaj jasnego, technicznego polskiego
+
+NIGDY nie wymyślaj faktów spoza dostarczonych źródeł."""
+
+    USER_TEMPLATE = """PYTANIE: {question}
+
+DOSTĘPNE ŹRÓDŁA:
 {context}
 
-Instrukcje:
-- Odpowiedz krótko (MAKS. 5 punktorów LUB 80–120 słów).
-- Jeśli to definicja/zakres: wskaż dokument(y), rozdział/paragraf i stronę.
-- Jeśli to procedura: wypunktuj kroki (maks. 7).
-- Jeśli odpowiedź jest niepełna: powiedz, czego brakuje.
-- Po odpowiedzi dodaj „Źródła:” z listą tylko tych cytowań, na które się powołałeś w treści.
-"""
+INSTRUKCJA:
+Odpowiedz zwięźle na pytanie używając TYLKO informacji z powyższych źródeł. 
+Zakończ sekcją "Źródła:" z listą cytowanych dokumentów."""
 
-# ------------------- Helpers -------------------
-def fmt_citation(hit: Dict[str, Any]) -> str:
-    t = hit.get("title") or "Dokument"
-    p = hit.get("page")
-    cid = hit.get("chunk_id")
-    return f"[{t}, str. {p}] ({cid})"
+    EXTRACTIVE_INTRO = "Na podstawie przeszukanych dokumentów:"
 
-def _shorten(txt: str, limit: int) -> str:
-    txt = (txt or "").strip().replace("\n", " ")
-    return txt[:limit].rsplit(" ", 1)[0] if len(txt) > limit else txt
 
-def build_context(hits: List[Dict[str, Any]], limit_per_hit: int) -> str:
-    blocks = []
-    for i, h in enumerate(hits, 1):
-        header = f"Źródło {i}: {h.get('title') or ''} | strona: {h.get('page')} | plik: {h.get('source_path')}\nID: {h.get('chunk_id')}"
-        body = _shorten(h.get("text") or "", limit_per_hit)
-        blocks.append(f"{header}\nTekst:\n{body}")
-    return "\n\n".join(blocks)
-
-def call_openai(messages: List[Dict[str, str]]) -> str:
-    """
-    Kompatybilne z nowszymi modelami czatowymi OpenAI.
-    Limitujemy długość odpowiedzi (220 tokenów), bez ustawiania temperature.
-    """
-    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-    model = OPENAI_MODEL
-    base = dict(model=model, messages=messages)
-
-    try:
-        resp = client.chat.completions.create(**base, max_completion_tokens=220)
-    except BadRequestError as e:
-        msg = str(e).lower()
-        if "max_completion_tokens" in msg and "unsupported" in msg:
-            resp = client.chat.completions.create(**base, max_tokens=220)
+class TextProcessor:
+    """Enhanced text processing utilities."""
+    
+    # Improved regex patterns
+    WORD_PATTERN = re.compile(r"\p{L}+", re.UNICODE)
+    SENTENCE_PATTERN = re.compile(
+        r"(?<=[\.\?!…])\s+(?=[\p{Lu}ĄĆĘŁŃÓŚŹŻ])", 
+        re.UNICODE
+    )
+    
+    # Question type detection patterns
+    SPEED_PATTERN = re.compile(
+        r"\b(prędkość|dozwolon\w*|dopuszczaln\w*|maksymaln\w*|ograniczon\w*|vmax|szybkość)\b",
+        re.IGNORECASE
+    )
+    DEADLINE_PATTERN = re.compile(
+        r"\b(termin|najpóźniej|w\s+terminie|deadline|do\s+kiedy|kiedy\s+należy)\b",
+        re.IGNORECASE
+    )
+    DEFINITION_PATTERN = re.compile(
+        r"\b(co\s+to\s+jest|czym\s+jest|definicja|znaczenie|oznacza)\b",
+        re.IGNORECASE
+    )
+    PROCEDURE_PATTERN = re.compile(
+        r"\b(jak\s+(?:się|można|należy)|procedura|proces|kroki|instrukcja|sposób)\b",
+        re.IGNORECASE
+    )
+    
+    @staticmethod
+    def tokenize(text: str) -> List[str]:
+        """Extract word tokens from text."""
+        return [w.lower() for w in TextProcessor.WORD_PATTERN.findall(text or "")]
+    
+    @staticmethod
+    def split_sentences(text: str) -> List[str]:
+        """Split text into sentences."""
+        text = (text or "").replace("\n", " ")
+        return [s.strip() for s in TextProcessor.SENTENCE_PATTERN.split(text) if s.strip()]
+    
+    @staticmethod
+    def clean_text(text: str) -> str:
+        """Clean and normalize text."""
+        text = (text or "").strip()
+        text = re.sub(r'\s+', ' ', text)  # Normalize whitespace
+        return text
+    
+    @staticmethod
+    def shorten_text(text: str, limit: int) -> str:
+        """Intelligently shorten text to word boundaries."""
+        text = TextProcessor.clean_text(text)
+        if len(text) <= limit:
+            return text
+        
+        # Try to cut at sentence boundary first
+        sentences = TextProcessor.split_sentences(text)
+        result = ""
+        for sent in sentences:
+            if len(result + sent) <= limit:
+                result += sent + " "
+            else:
+                break
+        
+        if result:
+            return result.strip()
+        
+        # Fall back to word boundary
+        return text[:limit].rsplit(" ", 1)[0] if " " in text[:limit] else text[:limit]
+    
+    @staticmethod
+    def detect_question_type(question: str) -> QuestionType:
+        """Detect the type of question for specialized handling."""
+        question_lower = question.lower()
+        
+        if TextProcessor.SPEED_PATTERN.search(question):
+            return QuestionType.SPEED
+        elif TextProcessor.DEADLINE_PATTERN.search(question):
+            return QuestionType.DEADLINE
+        elif TextProcessor.DEFINITION_PATTERN.search(question):
+            return QuestionType.DEFINITION
+        elif TextProcessor.PROCEDURE_PATTERN.search(question):
+            return QuestionType.PROCEDURE
         else:
-            raise
-    except NotFoundError:
-        raise SystemExit(
-            f"Model '{model}' nie jest dostępny dla Twojego klucza. "
-            "Ustaw RAG_CHAT_MODEL na model, do którego masz dostęp (np. 'gpt-4o-mini')."
-        )
-    return resp.choices[0].message.content.strip() if resp.choices else ""
+            return QuestionType.GENERAL
 
-# ------------------- Extractive helpers -------------------
-_WORD = re.compile(r"\p{L}+", re.UNICODE)
 
-def _tokens(s: str):
-    return [w.lower() for w in _WORD.findall(s or "")]
-
-def _overlap_score(q_tokens, sent_tokens):
-    if not q_tokens or not sent_tokens:
-        return 0.0
-    qs = set(q_tokens)
-    inter = sum(1 for t in sent_tokens if t in qs)
-    return inter / max(4, len(sent_tokens))
-
-def _best_sentences(question: str, hits: List[Dict[str, Any]], per_hit: int = 2, max_total: int = 8):
-    """Wybierz top zdania wg overlapu tokenów z pytaniem."""
-    qtok = _tokens(question)
-    picks: List[Tuple[str, Dict[str, Any]]] = []
-    for h in hits:
-        text = (h.get("text") or "").replace("\n", " ")
-        # podział na zdania: znak końca + następna wielka litera (uwzgl. PL)
-        sents = re.split(r"(?<=[\.\?!…])\s+(?=[\p{Lu}ĄĆĘŁŃÓŚŹŻ])", text)
-        scored: List[Tuple[float, str]] = []
-        for s in sents:
-            st = _tokens(s)
-            sc = _overlap_score(qtok, st)
-            if sc > 0:
-                scored.append((sc, s))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        for sc, s in scored[:per_hit]:
-            picks.append((s.strip(), h))
-    # de-dup near-identical
-    out: List[Tuple[str, Dict[str, Any]]] = []
-    seen: Set[str] = set()
-    for s, h in sorted(picks, key=lambda x: len(x[0])):  # krótsze zdania preferowane przy remisie
-        key = s.lower()[:160]
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append((s, h))
-        if len(out) >= max_total:
-            break
-    return out
-
-def _extract_deadlines(hits_list: List[Dict[str, Any]]):
-    patt = re.compile(
-        r"(termin\w*|najpóźniej|w\s+ciągu|do\s+dnia|nie\s+później\s+niż|w\s+terminie).{0,160}?"
-        r"(\d{1,2}\.\d{1,2}\.\d{4}|\d+\s*(?:dni|godz(?:in)?|tyg(?:odni)?|mies(?:ięcy)?))",
-        flags=re.IGNORECASE | re.UNICODE,
-    )
-    lines: List[Tuple[str, Dict[str, Any]]] = []
-    for h in hits_list:
-        text = (h.get("text") or "").replace("\n", " ")
-        for m in patt.finditer(text):
-            span = text[max(0, m.start()-80): m.end()+80]
-            lines.append((span.strip(), h))
-            if len(lines) >= 8:
-                break
-        if len(lines) >= 8:
-            break
-    return lines
-
-def _extract_speeds(hits_list: List[Dict[str, Any]]):
-    """
-    Ekstrakcja fragmentów o prędkościach (dozwolona/dopuszczalna/maks./ograniczona/Vmax).
-    Szuka słów-kluczy w pobliżu wartości liczbowych z jednostką km/h (różne warianty).
-    Przykłady wykrywanych wzorców:
-      - 'prędkość dozwolona 40 km/h', 'maks. 20 km/h', 'nie więcej niż 10 km/h'
-      - 'Vmax = 40 km/h', 'V = 20 km/h'
-      - zakresy: '5–10 km/h' albo '5-10 km/h'
-      - 'km na godzinę', 'km na godz.', 'km/godz', 'km h' (rzadsze zapisy)
-    """
-    # słowa-klucze w kontekście prędkości
-    speed_kw = r"(prędkość\w*|dozwolon\w*|dopuszczaln\w*|maksymaln\w*|ograniczon\w*|vmax|v\s*=?)"
-    # jednostki km/h w różnych zapisach
-    unit = r"(?:km\s*/?\s*h|km\s+na\s+g(?:odz(?:in(?:ę|y)?)?)?\.?)"
-    # liczba lub zakres liczb
-    num_or_range = r"(?:\d{1,3}(?:[.,]\d{1,2})?(?:\s*[-–]\s*\d{1,3}(?:[.,]\d{1,2})?)?)"
-    # opcjonalne słowa ograniczające
-    limit_words = r"(?:maks\.?|max|nie\s+więcej\s+niż|do|do\s+wartości|do\s+prędkości|≤|< =|<=)?"
-
-    patt = re.compile(
-        rf"{speed_kw}[^\.]{{0,160}}?{limit_words}\s*{num_or_range}\s*{unit}",
-        flags=re.IGNORECASE | re.UNICODE,
-    )
-    lines: List[Tuple[str, Dict[str, Any]]] = []
-    for h in hits_list:
-        text = (h.get("text") or "").replace("\n", " ")
-        for m in patt.finditer(text):
-            span = text[max(0, m.start()-80): m.end()+80]
-            # lekka normalizacja spacji
-            span = re.sub(r"\s+", " ", span).strip()
-            lines.append((span, h))
-            if len(lines) >= 8:
-                break
-        if len(lines) >= 8:
-            break
-    # jeśli nic nie znaleziono, spróbuj bardziej liberalnie: dowolna liczba + km/h bez słów-kluczy
-    if not lines:
-        loose = re.compile(
-            rf"{num_or_range}\s*{unit}",
-            flags=re.IGNORECASE | re.UNICODE,
-        )
-        for h in hits_list:
-            text = (h.get("text") or "").replace("\n", " ")
-            for m in loose.finditer(text):
-                span = text[max(0, m.start()-60): m.end()+60]
-                span = re.sub(r"\s+", " ", span).strip()
-                lines.append((span, h))
-                if len(lines) >= 6:
+class ExtractiveSearch:
+    """Enhanced extractive search for specialized queries."""
+    
+    def __init__(self, config: RAGConfig):
+        self.config = config
+    
+    def calculate_overlap_score(self, query_tokens: List[str], text_tokens: List[str]) -> float:
+        """Calculate semantic overlap between query and text."""
+        if not query_tokens or not text_tokens:
+            return 0.0
+        
+        query_set = set(query_tokens)
+        intersection = sum(1 for token in text_tokens if token in query_set)
+        
+        # Improved scoring with length normalization
+        base_score = intersection / len(text_tokens)
+        length_bonus = min(1.0, len(text_tokens) / 20)  # Prefer longer sentences
+        
+        return base_score * (1 + length_bonus * 0.2)
+    
+    def extract_best_sentences(
+        self, 
+        question: str, 
+        hits: List[Dict[str, Any]]
+    ) -> List[Tuple[str, Dict[str, Any]]]:
+        """Extract most relevant sentences from hits."""
+        query_tokens = TextProcessor.tokenize(question)
+        candidates = []
+        
+        for hit in hits:
+            text = hit.get("text", "")
+            sentences = TextProcessor.split_sentences(text)
+            
+            for sentence in sentences:
+                if len(sentence) < 20:  # Skip very short sentences
+                    continue
+                
+                sentence_tokens = TextProcessor.tokenize(sentence)
+                score = self.calculate_overlap_score(query_tokens, sentence_tokens)
+                
+                if score > self.config.context_overlap_threshold:
+                    candidates.append((score, sentence.strip(), hit))
+        
+        # Sort by score and deduplicate
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        
+        seen = set()
+        results = []
+        for score, sentence, hit in candidates:
+            # Simple deduplication by first 100 chars
+            key = sentence.lower()[:100]
+            if key not in seen:
+                seen.add(key)
+                results.append((sentence, hit))
+                if len(results) >= self.config.max_extractive_bullets:
                     break
-            if len(lines) >= 6:
+        
+        return results
+    
+    def extract_speed_info(self, hits: List[Dict[str, Any]]) -> List[Tuple[str, Dict[str, Any]]]:
+        """Extract speed-related information."""
+        # Enhanced speed pattern with more context
+        speed_pattern = re.compile(
+            r"(prędkość\w*|dozwolon\w*|dopuszczaln\w*|maksymaln\w*|ograniczon\w*|vmax|v\s*=?)"
+            r"[^\.\n]{0,200}?"
+            r"(\d{1,3}(?:[.,]\d{1,2})?(?:\s*[-–]\s*\d{1,3}(?:[.,]\d{1,2})?)?)\s*"
+            r"(?:km\s*/?\s*h|km\s+na\s+g(?:odz)?\.?)",
+            re.IGNORECASE | re.UNICODE
+        )
+        
+        results = []
+        for hit in hits:
+            text = hit.get("text", "").replace("\n", " ")
+            for match in speed_pattern.finditer(text):
+                start = max(0, match.start() - 100)
+                end = min(len(text), match.end() + 100)
+                context = TextProcessor.clean_text(text[start:end])
+                results.append((context, hit))
+                if len(results) >= 6:
+                    break
+            if len(results) >= 6:
                 break
-    return lines
+        
+        return results
+    
+    def extract_deadline_info(self, hits: List[Dict[str, Any]]) -> List[Tuple[str, Dict[str, Any]]]:
+        """Extract deadline-related information."""
+        deadline_pattern = re.compile(
+            r"(termin\w*|najpóźniej|w\s+ciągu|do\s+dnia|nie\s+później\s+niż|w\s+terminie)"
+            r"[^\.\n]{0,200}?"
+            r"(\d{1,2}\.\d{1,2}\.\d{4}|\d+\s*(?:dni|godz(?:in)?|tyg(?:odni)?|mies(?:ięcy)?))",
+            re.IGNORECASE | re.UNICODE
+        )
+        
+        results = []
+        for hit in hits:
+            text = hit.get("text", "").replace("\n", " ")
+            for match in deadline_pattern.finditer(text):
+                start = max(0, match.start() - 100)
+                end = min(len(text), match.end() + 100)
+                context = TextProcessor.clean_text(text[start:end])
+                results.append((context, hit))
+                if len(results) >= 6:
+                    break
+            if len(results) >= 6:
+                break
+        
+        return results
 
-def _looks_like_deadline_q(question: str) -> bool:
-    return bool(re.search(r"\btermin|najpóźniej|w\s+terminie\b", question, re.IGNORECASE))
 
-def _looks_like_speed_q(question: str) -> bool:
-    return bool(re.search(r"\b(prędkość|dozwolon\w*|dopuszczaln\w*|maksymaln\w*|ograniczon\w*|vmax)\b", question, re.IGNORECASE))
+class DocumentRetriever:
+    """Handle document retrieval from the retriever service."""
+    
+    def __init__(self, config: RAGConfig):
+        self.config = config
+    
+    def retrieve_documents(self, question: str) -> List[Dict[str, Any]]:
+        """Retrieve relevant documents for the question."""
+        try:
+            with httpx.Client(timeout=120) as client:
+                response = client.get(
+                    self.config.retriever_url, 
+                    params={"q": question}
+                )
+                response.raise_for_status()
+                data = response.json()
+                return data.get("hits", [])[:self.config.top_k]
+                
+        except httpx.RequestError as e:
+            logger.error(f"Error connecting to retriever service: {e}")
+            raise HTTPException(
+                status_code=503, 
+                detail="Retriever service unavailable"
+            )
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Retriever service error: {e}")
+            raise HTTPException(
+                status_code=e.response.status_code,
+                detail="Error retrieving documents"
+            )
 
-def _any_chunk_id_in_answer(answer: str, hits: List[Dict[str, Any]]) -> bool:
-    if not answer or not hits:
-        return False
-    ids = [str(h.get("chunk_id") or "") for h in hits if h.get("chunk_id")]
-    return any(i and i in answer for i in ids)
 
-# ------------------- Main QA flow -------------------
-def ask_once(question: str, top_k: int = TOP_K) -> Dict[str, Any]:
-    # 1) Retrieve
-    with httpx.Client(timeout=120) as c:
-        r = c.get(RETRIEVER_URL, params={"q": question})
-        r.raise_for_status()
-        hits = r.json().get("hits", [])[:top_k]
-
-    if not hits:
-        return {"answer": "Brak wyników w bazie dla tego pytania.", "hits": []}
-
-    # 2) Prompt build (skrót kontekstu, by utrzymać fokus)
-    context = build_context(hits, CHARS_PER_HIT)
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": USER_TEMPLATE.format(question=question, context=context)},
-    ]
-
-    # 3) Spróbuj LLM
-    answer = call_openai(messages)
-
-    # 4) Warunek „fallback/augment”: jeśli odpowiedź jest pusta/krótka LUB brak cytowań chunk_id
-    need_extractive = (not answer or len(answer.strip()) < 30) or (not _any_chunk_id_in_answer(answer, hits))
-
-    used_hits: List[Dict[str, Any]] = []
-    if need_extractive:
-        bullets: List[str] = []
-        used_set: Set[str] = set()
-
-        # najpierw najistotniejsze zdania
-        picks = _best_sentences(question, hits, per_hit=2, max_total=8)
-        for s, h in picks:
-            bullets.append(f"- {s}  ({fmt_citation(h)})")
-            cid = str(h.get("chunk_id"))
-            if cid and cid not in used_set:
-                used_set.add(cid)
-                used_hits.append(h)
-
-        # jeśli pytanie wygląda na „terminy”, dodaj ekstrakcję terminów
-        if _looks_like_deadline_q(question):
-            deadlines = _extract_deadlines(hits)
-            for span, h in deadlines:
-                bullets.append(f"- {span}  ({fmt_citation(h)})")
-                cid = str(h.get("chunk_id"))
-                if cid and cid not in used_set:
-                    used_set.add(cid)
-                    used_hits.append(h)
-
-        # jeśli pytanie wygląda na „prędkości”, dodaj ekstrakcję prędkości
-        if _looks_like_speed_q(question):
-            speeds = _extract_speeds(hits)
-            for span, h in speeds:
-                bullets.append(f"- {span}  ({fmt_citation(h)})")
-                cid = str(h.get("chunk_id"))
-                if cid and cid not in used_set:
-                    used_set.add(cid)
-                    used_hits.append(h)
-
-        bullets = bullets[:8]
-
-        if bullets:
-            answer = "Najistotniejsze informacje ze źródeł:\n" + "\n".join(bullets)
+class AnswerGenerator:
+    """Generate answers using OpenAI with improved prompting."""
+    
+    def __init__(self, config: RAGConfig):
+        self.config = config
+        self.client = OpenAI(api_key=config.openai_api_key)
+    
+    def format_citation(self, hit: Dict[str, Any]) -> str:
+        """Format citation for a document hit."""
+        title = hit.get("title") or "Dokument"
+        page = hit.get("page")
+        chunk_id = hit.get("chunk_id")
+        
+        if page:
+            return f"[{title}, str. {page}] ({chunk_id})"
         else:
-            # brak sensownych dopasowań — wracamy do krótkiego komunikatu
-            answer = answer.strip() if answer and len(answer.strip()) >= 30 else "Nie znajduję jednoznacznej odpowiedzi w dostarczonych źródłach."
+            return f"[{title}] ({chunk_id})"
+    
+    def build_context(self, hits: List[Dict[str, Any]]) -> str:
+        """Build context from document hits with improved formatting."""
+        if not hits:
+            return "Brak dostępnych źródeł."
+        
+        blocks = []
+        for i, hit in enumerate(hits, 1):
+            title = hit.get('title', 'Dokument')
+            page = hit.get('page', 'N/A')
+            source_path = hit.get('source_path', '')
+            chunk_id = hit.get('chunk_id', '')
+            text = hit.get('text', '')
+            
+            # Create clean source header
+            header = f"Źródło {i}: {title}"
+            if page != 'N/A':
+                header += f" | strona: {page}"
+            if source_path:
+                header += f" | plik: {source_path}"
+            header += f"\nID: {chunk_id}"
+            
+            # Clean and shorten text
+            clean_text = TextProcessor.shorten_text(text, self.config.chars_per_hit)
+            
+            blocks.append(f"{header}\nTekst:\n{clean_text}")
+        
+        return "\n\n".join(blocks)
+    
+    def generate_llm_answer(self, question: str, hits: List[Dict[str, Any]]) -> str:
+        """Generate answer using LLM."""
+        if not self.config.openai_api_key:
+            logger.warning("No OpenAI API key provided")
+            return ""
+        
+        try:
+            context = self.build_context(hits)
+            
+            messages = [
+                {"role": "system", "content": PromptTemplates.SYSTEM_PROMPT},
+                {"role": "user", "content": PromptTemplates.USER_TEMPLATE.format(
+                    question=question, 
+                    context=context
+                )}
+            ]
+            
+            # Try with max_completion_tokens first (newer models)
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.config.openai_model,
+                    messages=messages,
+                    max_completion_tokens=self.config.max_completion_tokens,
+                    temperature=0.1  # Low temperature for consistency
+                )
+            except BadRequestError as e:
+                if "max_completion_tokens" in str(e).lower():
+                    # Fall back to max_tokens for older models
+                    response = self.client.chat.completions.create(
+                        model=self.config.openai_model,
+                        messages=messages,
+                        max_tokens=self.config.max_completion_tokens,
+                        temperature=0.1
+                    )
+                else:
+                    raise
+            
+            if response.choices:
+                return response.choices[0].message.content.strip()
+            
+        except NotFoundError:
+            logger.error(f"Model '{self.config.openai_model}' not available")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model '{self.config.openai_model}' not available. "
+                       "Set RAG_CHAT_MODEL to an available model."
+            )
+        except Exception as e:
+            logger.error(f"Error generating LLM answer: {e}")
+            
+        return ""
+    
+    def has_citations_in_answer(self, answer: str, hits: List[Dict[str, Any]]) -> bool:
+        """Check if answer contains citations to the provided hits."""
+        if not answer or not hits:
+            return False
+        
+        chunk_ids = [str(hit.get("chunk_id", "")) for hit in hits if hit.get("chunk_id")]
+        return any(chunk_id and chunk_id in answer for chunk_id in chunk_ids)
 
-    # 5) Blok „Źródła:” — zależnie od ścieżki
-    if "Źródła:" not in answer:
-        if used_hits:
-            # w fallbacku pokazujemy tylko faktycznie użyte
-            uniq = []
-            seen_ids = set()
-            for h in used_hits:
-                cid = h.get("chunk_id")
-                if cid and cid not in seen_ids:
-                    uniq.append(h)
-                    seen_ids.add(cid)
-            citations = "\n".join(f"- {fmt_citation(h)}" for h in uniq)
-        else:
-            # dla odpowiedzi LLM (bez pewności jakie cytował) ograniczamy do 4 pierwszych
-            citations = "\n".join(f"- {fmt_citation(h)}" for h in hits[:4])
-        answer = f"{answer}\n\nŹródła:\n{citations}"
 
-    return {"answer": answer, "hits": hits}
+class RAGAnswerer:
+    """Main RAG answering system."""
+    
+    def __init__(self, config: Optional[RAGConfig] = None):
+        self.config = config or RAGConfig()
+        self.retriever = DocumentRetriever(self.config)
+        self.generator = AnswerGenerator(self.config)
+        self.extractive = ExtractiveSearch(self.config)
+        
+        # Validate configuration
+        if not self.config.openai_api_key:
+            logger.warning("OpenAI API key not set - LLM generation will be disabled")
+    
+    def ask(self, question: str) -> Dict[str, Any]:
+        """Answer a question using RAG."""
+        logger.info(f"Processing question: {question[:100]}...")
+        
+        try:
+            # 1. Retrieve relevant documents
+            hits = self.retriever.retrieve_documents(question)
+            
+            if not hits:
+                return {
+                    "answer": "Nie znaleziono żadnych dokumentów odnoszących się do tego pytania.",
+                    "hits": [],
+                    "method": "no_results"
+                }
+            
+            # 2. Detect question type for specialized handling
+            question_type = TextProcessor.detect_question_type(question)
+            logger.info(f"Detected question type: {question_type.value}")
+            
+            # 3. Try LLM generation first
+            llm_answer = self.generator.generate_llm_answer(question, hits)
+            
+            # 4. Evaluate if we need extractive fallback
+            need_extractive = (
+                not llm_answer or 
+                len(llm_answer.strip()) < self.config.min_answer_length or
+                not self.generator.has_citations_in_answer(llm_answer, hits)
+            )
+            
+            used_hits = []
+            final_answer = ""
+            method = ""
+            
+            if need_extractive:
+                logger.info("Using extractive search approach")
+                
+                # Build extractive answer based on question type
+                bullets = []
+                used_chunk_ids = set()
+                
+                # General sentence extraction
+                sentences = self.extractive.extract_best_sentences(question, hits)
+                for sentence, hit in sentences:
+                    citation = self.generator.format_citation(hit)
+                    bullets.append(f"• {sentence} ({citation})")
+                    
+                    chunk_id = hit.get("chunk_id")
+                    if chunk_id and chunk_id not in used_chunk_ids:
+                        used_chunk_ids.add(chunk_id)
+                        used_hits.append(hit)
+                
+                # Specialized extraction based on question type
+                if question_type == QuestionType.SPEED:
+                    speed_info = self.extractive.extract_speed_info(hits)
+                    for info, hit in speed_info:
+                        citation = self.generator.format_citation(hit)
+                        bullets.append(f"• {info} ({citation})")
+                        
+                        chunk_id = hit.get("chunk_id")
+                        if chunk_id and chunk_id not in used_chunk_ids:
+                            used_chunk_ids.add(chunk_id)
+                            used_hits.append(hit)
+                
+                elif question_type == QuestionType.DEADLINE:
+                    deadline_info = self.extractive.extract_deadline_info(hits)
+                    for info, hit in deadline_info:
+                        citation = self.generator.format_citation(hit)
+                        bullets.append(f"• {info} ({citation})")
+                        
+                        chunk_id = hit.get("chunk_id")
+                        if chunk_id and chunk_id not in used_chunk_ids:
+                            used_chunk_ids.add(chunk_id)
+                            used_hits.append(hit)
+                
+                # Limit bullets and create final answer
+                bullets = bullets[:self.config.max_extractive_bullets]
+                
+                if bullets:
+                    final_answer = f"{PromptTemplates.EXTRACTIVE_INTRO}\n" + "\n".join(bullets)
+                    method = "extractive"
+                else:
+                    final_answer = "Nie udało się znaleźć odpowiedzi w dostarczonych dokumentach."
+                    method = "no_match"
+            
+            else:
+                logger.info("Using LLM-generated answer")
+                final_answer = llm_answer
+                method = "llm"
+                used_hits = hits[:4]  # Show top hits for LLM answers
+            
+            # 5. Add sources section if not already present
+            if "Źródła:" not in final_answer:
+                sources_hits = used_hits if used_hits else hits[:4]
+                # Remove duplicates
+                unique_hits = []
+                seen_ids = set()
+                for hit in sources_hits:
+                    chunk_id = hit.get("chunk_id")
+                    if chunk_id and chunk_id not in seen_ids:
+                        seen_ids.add(chunk_id)
+                        unique_hits.append(hit)
+                
+                if unique_hits:
+                    sources = "\n".join(
+                        f"• {self.generator.format_citation(hit)}" 
+                        for hit in unique_hits
+                    )
+                    final_answer = f"{final_answer}\n\nŹródła:\n{sources}"
+            
+            logger.info(f"Generated answer using {method} method")
+            
+            return {
+                "answer": final_answer,
+                "hits": hits,
+                "method": method,
+                "question_type": question_type.value
+            }
+            
+        except Exception as e:
+            logger.error(f"Error processing question: {e}")
+            return {
+                "answer": f"Wystąpił błąd podczas przetwarzania pytania: {str(e)}",
+                "hits": [],
+                "method": "error"
+            }
 
-# ------------------- CLI / API -------------------
-def cli():
-    q = " ".join(sys.argv[1:]).strip()
-    if not q:
-        print('Użycie: python answer_rag.py "Twoje pytanie"  |  lub  python answer_rag.py serve')
-        sys.exit(1)
-    out = ask_once(q)
-    print("\n" + out["answer"])
 
-app = FastAPI(title="RAG Answerer (PL) — robust + speeds")
+# FastAPI Application
+app = FastAPI(
+    title="RAG Answerer (Enhanced)",
+    description="Enhanced RAG system with improved answer quality and specialized question handling",
+    version="2.0"
+)
 
-class AskIn(BaseModel):
-    q: str
+# Global RAG instance
+rag_answerer = RAGAnswerer()
 
-class AskOut(BaseModel):
-    answer: str
-    hits: list
 
-@app.get("/ask", response_model=AskOut)
+class AskRequest(BaseModel):
+    q: str = Field(..., description="Pytanie po polsku")
+
+
+class AskResponse(BaseModel):
+    answer: str = Field(..., description="Odpowiedź na pytanie")
+    hits: List[Dict[str, Any]] = Field(..., description="Znalezione dokumenty")
+    method: str = Field(..., description="Metoda generowania odpowiedzi")
+    question_type: Optional[str] = Field(None, description="Typ pytania")
+
+
+@app.get("/ask", response_model=AskResponse)
 def ask_get(q: str = Query(..., description="Pytanie po polsku")):
-    return ask_once(q)
+    """Ask a question via GET request."""
+    return rag_answerer.ask(q)
 
-@app.post("/ask", response_model=AskOut)
-def ask_post(body: AskIn):
-    return ask_once(body.q)
 
-if __name__ == "__main__":
-    if len(sys.argv) >= 2 and sys.argv[1] == "serve":
+@app.post("/ask", response_model=AskResponse)
+def ask_post(request: AskRequest):
+    """Ask a question via POST request."""
+    return rag_answerer.ask(request.q)
+
+
+@app.get("/health")
+def health_check():
+    """Health check endpoint."""
+    return {"status": "healthy", "version": "2.0"}
+
+
+def cli():
+    """Command line interface."""
+    if len(sys.argv) < 2:
+        print('Użycie: python answer_rag_refactored.py "Twoje pytanie"')
+        print('   lub: python answer_rag_refactored.py serve')
+        sys.exit(1)
+    
+    if sys.argv[1] == "serve":
         import uvicorn
+        logger.info("Starting RAG Answer API server...")
         uvicorn.run(app, host="127.0.0.1", port=8010)
     else:
-        cli()
+        question = " ".join(sys.argv[1:]).strip()
+        result = rag_answerer.ask(question)
+        print(f"\n{result['answer']}")
+        
+        if logger.isEnabledFor(logging.INFO):
+            print(f"\n[Metoda: {result['method']}, Typ: {result.get('question_type', 'N/A')}]")
+
+
+if __name__ == "__main__":
+    cli()

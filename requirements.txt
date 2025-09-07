@@ -7,7 +7,6 @@ tqdm
 regex
 tiktoken
 sentence-transformers>=3.0
-faiss-cpu
 torch>=2.2
 rank-bm25
 fastapi
@@ -20,3 +19,4 @@ httpx
 openai
 einops
 sentencepiece
+qdrant-client
