@@ -49,27 +49,28 @@ class RAGConfig:
     openai_api_key: str = os.environ.get("OPENAI_API_KEY", "")
 
     # Search parameters
-    top_k: int = int(os.environ.get("RAG_TOPK", "4"))  # Reduced from 5
-    chars_per_hit: int = int(os.environ.get("RAG_CHARS_PER_HIT", "400"))  # Reduced from 500
+    top_k: int = int(os.environ.get("RAG_TOPK", "5"))  # Reduced from 5
+    chars_per_hit: int = int(os.environ.get(
+        "RAG_CHARS_PER_HIT", "500"))  # Reduced from 500
 
     # Response limits
     max_completion_tokens: int = 4000
-    
+
     # Cache settings
     cache_ttl: int = int(os.environ.get("CACHE_TTL", "3600"))  # 1 hour
 
 
 class ResponseCache:
     """Simple in-memory response cache."""
-    
+
     def __init__(self, ttl: int = 3600):
         self.ttl = ttl
         self.cache = {}
-    
+
     def _get_key(self, question: str) -> str:
         """Generate cache key from question."""
         return hashlib.md5(question.lower().strip().encode()).hexdigest()
-    
+
     def get(self, question: str) -> Optional[Dict[str, Any]]:
         """Get cached response if exists and not expired."""
         key = self._get_key(question)
@@ -81,16 +82,16 @@ class ResponseCache:
                 # Remove expired entry
                 del self.cache[key]
         return None
-    
+
     def set(self, question: str, response: Dict[str, Any]) -> None:
         """Cache response."""
         key = self._get_key(question)
         self.cache[key] = (time.time(), response)
-    
+
     def clear(self) -> None:
         """Clear all cached responses."""
         self.cache.clear()
-    
+
     def size(self) -> int:
         """Get number of cached items."""
         return len(self.cache)
@@ -317,7 +318,8 @@ class AnswerGenerator:
                 response = self.client.chat.completions.create(
                     model=self.config.openai_model,
                     messages=messages,
-                    max_completion_tokens=self.config.max_completion_tokens
+                    max_completion_tokens=self.config.max_completion_tokens,
+                    reasoning_effort="minimal"
                 )
             except BadRequestError as e:
                 error_str = str(e).lower()
@@ -325,20 +327,12 @@ class AnswerGenerator:
                     f"BadRequestError with max_completion_tokens: {e}")
 
                 if "max_completion_tokens" in error_str or "max_tokens" in error_str:
-                    # gpt-5-mini requires max_completion_tokens without temperature
-                    logger.info("Trying with max_completion_tokens only")
+                    logger.info("Trying without max_completion_tokens")
                     response = self.client.chat.completions.create(
                         model=self.config.openai_model,
                         messages=messages,
-                        max_completion_tokens=self.config.max_completion_tokens
-                    )
-                elif "model" in error_str and "not found" in error_str:
-                    logger.error(
-                        f"Model {self.config.openai_model} not found. Trying gpt-5-mini as fallback.")
-                    response = self.client.chat.completions.create(
-                        model="gpt-5-mini",
-                        messages=messages,
-                        max_completion_tokens=self.config.max_completion_tokens
+                        max_tokens=self.config.max_completion_tokens,
+                        reasoning_effort="minimal"
                     )
                 else:
                     raise
@@ -454,11 +448,11 @@ class RAGAnswerer:
                 "method": method,
                 "question_type": question_type.value
             }
-            
+
             # Cache successful responses
             if method != "error":
                 self.cache.set(question, result)
-            
+
             return result
 
         except Exception as e:
